@@ -522,11 +522,14 @@ class _SettingsPageState extends State<SettingsPage> {
       }
     } else {
       // iOS：未签名 IPA 系统装不上，只有【匿名可访问】的直链才谈得上自动下载 ——
-      // TrollStore 自己发起请求时带不了 GitHub 登录态，而源码仓库是 private。
+      // TrollStore 自己发起请求时带不了任何登录态，一键装只能用 GitHub 直链。
       final ts = latest.iosTrollstore;
       final gh = latest.iosGithubUrl;
+      // 蒲公英管理中心直下链接：国内下载远快于 GitHub，但浏览器里要有蒲公英登录态
+      // （未登录打开会是登录页，所以只给「手动下载」用，不用于一键装）
+      final mgr = latest.iosPgyerManagerUrl;
       if (ts != null && ts.isNotEmpty) {
-        // 一键装：只有「建了公开产物仓库 + 配了 RELEASE_REPO」才会走到这里
+        // 一键装：仓库公开后 version.json 会带这个字段，链接指向 GitHub Release 直链
         list.add(FilledButton.icon(
           onPressed: () => openLink(ts),
           icon: const Icon(Icons.download, size: 16),
@@ -538,14 +541,30 @@ class _SettingsPageState extends State<SettingsPage> {
           ),
         ));
       }
+      if (mgr != null && mgr.isNotEmpty) {
+        // 主入口：蒲公英直下（快），登录态由浏览器负责
+        list.add(FilledButton.icon(
+          onPressed: () => openLink(mgr),
+          icon: const Icon(Icons.download, size: 16),
+          label: const Text('下载 IPA（蒲公英·快）', style: TextStyle(fontSize: 13)),
+          style: FilledButton.styleFrom(
+            backgroundColor: _green,
+            foregroundColor: Colors.white,
+            visualDensity: VisualDensity.compact,
+          ),
+        ));
+      }
       if (gh != null && gh.isNotEmpty) {
         list.add(TextButton(
           onPressed: () => openLink(gh),
-          child: const Text('下载 IPA', style: TextStyle(color: _green, fontSize: 13)),
+          child: Text(mgr != null && mgr.isNotEmpty
+              ? '下载 IPA（GitHub·慢）'
+              : '下载 IPA',
+              style: const TextStyle(color: _green, fontSize: 13)),
         ));
       }
       if (_iosNeedsLoginDownload(latest)) {
-        // 没有任何匿名可访问的 IPA 直链 → 走【已登录】的页面自己下：
+        // 没有任何 IPA 直链（连 GitHub 都没有）→ 走【已登录】的页面自己下：
         // 主入口是蒲公英管理中心（版本管理里点下载即得现签链接）；
         // 备用入口是源码仓库的 Release 页面（手机上登录 GitHub 也能下到）。
         // 管理中心依赖构建期注入的 PGYER_APP_KEY，未注入 → 只显示 GitHub 下载页。

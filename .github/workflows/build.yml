@@ -494,6 +494,13 @@ jobs:
             PGYER_IOS_IPA_URL=$(grep -m1 '^IPA_URL=' meta/pgyer_ios_meta.txt | cut -d= -f2- | tr -d '[:space:]' || true)
           fi
           export PGYER_IOS_IPA_URL
+          # 蒲公英管理中心直下链接（需登录态）：给 version.json 的 ios_pgyer_manager_url，
+          # App 内 iOS「下载 IPA」优先用它 —— 国内到蒲公英远快于到 GitHub
+          PGYER_IOS_MANAGER_URL=""
+          if [ -f meta/pgyer_ios_meta.txt ]; then
+            PGYER_IOS_MANAGER_URL=$(grep -m1 '^MANAGER_URL=' meta/pgyer_ios_meta.txt | cut -d= -f2- | tr -d '[:space:]' || true)
+          fi
+          export PGYER_IOS_MANAGER_URL
           # 生成逻辑全在 scripts/gen_version_json.py 里：
           #   · ⚠️ GitHub 直链只在配了 vars.RELEASE_REPO（【公开】仓库）时才非空 ——
           #     本仓库是 private，它的 Release 资源匿名访问一律 404，写进去就是点了报错的死链；

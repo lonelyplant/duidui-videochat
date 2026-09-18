@@ -8,6 +8,7 @@
   android_url                            蒲公英下载页（永远可用）
   android_apk_url                        安卓 APK 直链
   ios_pgyer_url                          蒲公英现签 IPA 直链（约几分钟时效，通常为空串）
+  ios_pgyer_manager_url                  蒲公英管理中心直下链接（国内快，但需浏览器有蒲公英登录态）
   ios_github_url                         IPA 直链
   ios_trollstore                         apple-magnifier:// 一键装 scheme
 
@@ -78,6 +79,8 @@ def main():
         print(f"::notice::version.json 直链基址：{base}")
 
     ipa_url = f"{base}/{IPA}" if base else ""
+    # 蒲公英管理中心直下链接：CI 从 pgyer_ios_meta.txt 里带出（源码不落任何应用标识）
+    mgr_url = (os.environ.get("PGYER_IOS_MANAGER_URL") or "").strip()
     data = {
         "build": int(run),
         "version": f"1.0.{run}",
@@ -87,6 +90,7 @@ def main():
         "android_url": PGYER_PAGE,
         "android_apk_url": f"{base}/{APK}" if base else "",
         "ios_pgyer_url": (os.environ.get("PGYER_IOS_IPA_URL") or "").strip(),
+        "ios_pgyer_manager_url": mgr_url,
         "ios_github_url": ipa_url,
         "ios_trollstore": f"apple-magnifier://install?url={ipa_url}" if ipa_url else "",
     }

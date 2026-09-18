@@ -122,6 +122,7 @@ class AppUpdate {
   final String? androidUrl; // 蒲公英应用页（兜底入口）
   final String? androidApkUrl; // 安卓直装/直下链接（浏览器打开即开始下载）
   final String? iosPgyerUrl; // 蒲公英签名 IPA 直链（仅几分钟时效，通常为空）
+  final String? iosPgyerManagerUrl; // 蒲公英管理中心直下链接（国内快，需浏览器有蒲公英登录态）
   final String? iosGithubUrl; // 公开 Release 的 IPA 直链（永久有效）
   final String? iosTrollstore; // apple-magnifier:// 一键装 scheme
   final String source; // 来源标记，排错用（如 pgyer-api+version.json）
@@ -134,6 +135,7 @@ class AppUpdate {
     this.androidUrl,
     this.androidApkUrl,
     this.iosPgyerUrl,
+    this.iosPgyerManagerUrl,
     this.iosGithubUrl,
     this.iosTrollstore,
     this.source = '',
@@ -150,6 +152,7 @@ class AppUpdate {
         androidUrl: _link(j['android_url']),
         androidApkUrl: _link(j['android_apk_url']),
         iosPgyerUrl: _link(j['ios_pgyer_url']),
+        iosPgyerManagerUrl: _link(j['ios_pgyer_manager_url']),
         iosGithubUrl: _link(j['ios_github_url']),
         iosTrollstore: _link(j['ios_trollstore']),
         source: 'version.json',
@@ -168,6 +171,7 @@ class AppUpdate {
       androidUrl: base.androidUrl ?? extra.androidUrl,
       androidApkUrl: base.androidApkUrl ?? extra.androidApkUrl,
       iosPgyerUrl: base.iosPgyerUrl ?? extra.iosPgyerUrl,
+      iosPgyerManagerUrl: base.iosPgyerManagerUrl ?? extra.iosPgyerManagerUrl,
       iosGithubUrl: base.iosGithubUrl ?? extra.iosGithubUrl,
       iosTrollstore: base.iosTrollstore ?? extra.iosTrollstore,
       source: [base.source, extra.source]
