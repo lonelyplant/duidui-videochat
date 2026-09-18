@@ -189,9 +189,9 @@ jobs:
           [ -z "$DESC" ] && DESC=$(git log -1 --pretty=format:"- %s")
           UPDATE_DESC="Android #${{ github.run_number }}"
           if [ -n "$DESC" ]; then UPDATE_DESC="$UPDATE_DESC"$'\n'"$DESC"; fi
-      RESP=$(curl -sS --retry 3 --retry-delay 5 --retry-all-errors --connect-timeout 30 \
-           --max-time 1800 \
-           -F "file=@build/dist/duidui_video.apk" \
+          RESP=$(curl -sS --retry 3 --retry-delay 5 --retry-all-errors --connect-timeout 30 \
+               --max-time 1800 \
+               -F "file=@build/dist/duidui_video.apk" \
                -F "_api_key=$PGYER_API_KEY" \
                -F "buildUpdateDescription=$UPDATE_DESC" \
                https://www.pgyer.com/apiv2/app/upload)
