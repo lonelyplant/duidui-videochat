@@ -1,0 +1,46 @@
+name: duidui_video
+description: 对对视频 — 省流量视频通话（安卓 / iOS，基于声网 Agora）
+publish_to: 'none'
+version: 1.0.0+5
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  # 6.6.2+ 才自带画中画（PiP）API：engine.createPipController()
+  agora_rtc_engine: ^6.6.4
+  shared_preferences: ^2.2.2
+  # 视频期间保持屏幕常亮（防熄屏），挂断时释放
+  # ⚠️ 上限锁 <1.4.0：wakelock_plus 1.4.0 起改用「新式」android/build.gradle
+  # （compileSdk = flutter.compileSdkVersion + 自带 AGP 8.12.1 / Kotlin 2.2.0），
+  # 在 CI 的 Flutter 3.24.0 插件加载器下取不到 flutter 扩展 → 评估 :wakelock_plus
+  # 时「Could not get unknown property 'flutter'」直接构建失败。
+  # 1.3.3 用老式 compileSdk 34 + AGP 8.3.1，与 3.24.0 匹配；其 API（WakelockPlus.enable/
+  # disable）跨版本不变，锁版本不影响功能。1.3.3 要求 package_info_plus >=6 <9（即 8.x）。
+  wakelock_plus: '>=1.2.0 <1.4.0'
+  # Android 6+ 摄像头/麦克风必须运行时申请（iOS 会自动弹窗，Android 不会）。
+  # 不申请的后果：安卓本地预览黑屏、且什么都没发出去，对端看不到画面。
+  permission_handler: ^11.3.1
+  # 检测更新：拉取 version.json + 打开下载页 / TrollStore scheme
+  http: ^1.2.0
+  url_launcher: ^6.3.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+# ⚠️ 兼容锁（双保险）：package_info_plus ≥9.0.0 是「wakelock_plus 1.4.0」拉进来的传递依赖
+# （见上方 wakelock_plus 上限说明）。9.x 的 android/build.gradle 用
+# compileSdk = flutter.compileSdkVersion + 自带 buildscript{ AGP 8.12.1 / Kotlin 2.2.0 }，
+# 在 CI 的 Flutter 3.24.0 插件加载器下取不到 flutter 扩展 →
+# 评估 :package_info_plus 时「Could not get unknown property 'flutter'」导致安卓构建失败。
+# 8.3.0 用老式 `compileSdk 34` + AGP 8.3.1，与 3.24.0 匹配；公开 API
+# （PackageInfo.fromPlatform 等）跨 8/9 不变，不影响运行。
+dependency_overrides:
+  package_info_plus: '>=8.0.0 <9.0.0'
+
+flutter:
+  uses-material-design: true

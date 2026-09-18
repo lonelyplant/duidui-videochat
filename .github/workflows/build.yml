@@ -1,0 +1,547 @@
+# 对对视频：一键构建 APK + IPA，并自动上传到蒲公英(pgyer)分发。
+#
+# ⚠️ 本仓库公开后任何人可读全部文件与历史，所有应用标识/密钥一律放 Secrets（源码不落值）。
+# 仓库 Settings → Secrets and variables → Actions 配置：
+#   【必需】ANDROID_KEYSTORE_BASE64   : 安卓签名 keystore 的 base64
+#                                       （生成方法见 scripts/patch_android_signing.py 头部注释）
+#   【必需】ANDROID_KEYSTORE_PASSWORD : 上面 keystore 的密码
+#   【必需】AGORA_APP_ID              : 声网项目 App ID（--dart-define 注入 App）
+#   【可选】PGYER_SHORTCUT_ANDROID    : 安卓蒲公英公开下载页短链名（App 内更新检测/下载入口）
+#   【可选】PGYER_SHORTCUT_IOS        : iOS 蒲公英公开下载页短链名
+#   【可选】PGYER_API_KEY             : 蒲公英 API Key。两个用途：① 上传 APK/IPA 到蒲公英；
+#                               ② 配合 vars.PGYER_APP_KEY_*（或公开页 / listMy 自动解析）让
+#                               「设置 → 检测更新」调 apiv2/app/check 拿更新说明/大小/直装链接。
+#                               不配则两者都跳过。⚠️ 账号级凭据，会随 --dart-define 编进包里。
+#   【可选】vars.PGYER_APP_KEY_ANDROID / vars.PGYER_APP_KEY_IOS
+#                               : 各平台蒲公英 appKey 的显式指定（不配则自动解析）
+#   【可选】IOS_CERTIFICATE / IOS_CERT_PASSWORD / IOS_PROVISIONING_PROFILE
+#                               : iOS 开发证书；不配则产出未签名 IPA（供 TrollStore 重签）
+#   【可选】RELEASE_TOKEN           : 跨仓库发布时的 PAT；发布到本仓库自身用 GITHUB_TOKEN 即可
+#   【可选】vars.RELEASE_REPO       : 公开发布仓库。不配 = 发布到本仓库自身 ——
+#                               本仓库公开后其 Release 资源匿名可访问，固定直链全部有效。
+# 触发：推送到 main 分支，或手动 Run workflow。
+#
+# 注意：GitHub Actions 的 `if:` 表达式不能引用 secrets 上下文，故所有“按需跳过”逻辑
+# 改为在 step 的 env 中映射 secret，再用 run 内的 shell 判断（[ -z "$X" ]）控制，安全且不会被拦截。
+# 应用标识用 Secrets 而不是 Variables 装：iOS 构建带 --verbose，dart-define 的值可能进构建日志，
+# 公开仓库的日志人人可见 —— Secrets 会被 GitHub 自动打码，Variables 不会。
+name: 构建 APK 与 IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+# 同一分支同时只跑一个构建：否则两次构建的 release job 会互相删/建 latest 发布（竞态），
+# 且会让蒲公英/ Release 出现重复版本。新的推送直接取消旧的，省时间也避免踩踏。
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ============ 安卓 APK（ubuntu 即可，无需 Mac） ============
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: '3.24.0'
+      # 生成原生脚手架（仓库只提交 Dart + 原生补丁，故先 scaffold 再覆盖）
+      - run: flutter create --project-name duidui_video --platforms=android,ios --android-language kotlin --ios-language swift .
+      - run: flutter pub get
+      - run: cp -r native_patches/android/app/src/main/AndroidManifest.xml android/app/src/main/AndroidManifest.xml
+      - run: mkdir -p android/app/src/main/kotlin/com/example/duidui_video
+      - run: cp native_patches/android/app/src/main/kotlin/com/example/duidui_video/MainActivity.kt android/app/src/main/kotlin/com/example/duidui_video/MainActivity.kt
+      - run: cp native_patches/ios/Runner/Info.plist ios/Runner/Info.plist
+      # AppDelegate 只多挂了一条 duidui/native 通道（goHome：退后台不杀进程，给 PiP 用）。
+      # ⚠️ 它不做 AVCaptureSession swizzle，和之前那个导致未签名包闪退的补丁无关。
+      - run: cp native_patches/ios/Runner/AppDelegate.swift ios/Runner/AppDelegate.swift
+      # 固定 release 签名：脚手架默认用 runner 随机生成的 debug keystore，每次出包
+      # 签名都不同，覆盖安装必报「签名不一致」。keystore/密码走 Secrets，绝不进仓库。
+      - name: Restore keystore from Secrets & patch signing (可覆盖安装)
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: python3 scripts/patch_android_signing.py
+      # 修复 Kotlin 元数据不兼容：flutter create 生成的 Kotlin Gradle 插件版本偏旧，
+      # 与 shared_preferences_android(用 Kotlin 1.9 编译) 冲突，提升到大版本 1.9.x。
+      - name: Bump Kotlin version
+        working-directory: android
+        run: |
+          if grep -q "org.jetbrains.kotlin.android" settings.gradle; then
+            sed -i 's/id "org.jetbrains.kotlin.android" version "[^"]*"/id "org.jetbrains.kotlin.android" version "1.9.24"/' settings.gradle
+          fi
+          if grep -q "ext.kotlin_version" build.gradle; then
+            sed -i 's/ext.kotlin_version = .*/ext.kotlin_version = "1.9.24"/' build.gradle
+          fi
+          echo "--- kotlin refs after bump ---"
+          grep -n "kotlin" settings.gradle build.gradle 2>/dev/null | head
+      # 按 ABI 拆分：默认的「通用包」把 arm / arm64 / x86_64 三套声网 .so 全打进去
+      # （143 MB ≈ 48 MB × 3）。拆开后只取 arm64 那一份，体积降到约 1/3。
+      # 现代手机（含 Xiaomi 14）清一色 arm64，32 位/ x86 那份没必要分发。
+      # 版本名 1.0.<run_number>、构建号 run_number：每次推送版本号都真实升级，
+      # 蒲公英/App 内直接可见（1.0.0 → 1.0.21 → 1.0.22 …）；APP_BUILD 注入给 App 首页显示用。
+      # 解析蒲公英 appKey：App 内「检测更新」用它调 apiv2/app/check，
+      # 从而拿到更新说明、包大小和【直装链接】（安卓浏览器点开即开始下载 APK）。
+      # 候选顺序：vars 显式指定 → 公开页 SSR HTML 里的 agKey（零凭据）→ apiv2/app/listMy，
+      # 每个候选都**真调一次 check 实证**（agKey 与 appKey 命名不同、是否等价未经证实）。
+      # 解析失败不 fail 构建 —— App 会退回「公开页解析」+ 按平台写死的 agKey。
+      - name: Resolve Pgyer appKey (android)
+        env:
+          PGYER_API_KEY: ${{ secrets.PGYER_API_KEY }}
+          PGYER_APP_KEY: ${{ vars.PGYER_APP_KEY_ANDROID }}
+          PGYER_SHORTCUT_ANDROID: ${{ secrets.PGYER_SHORTCUT_ANDROID }}
+        run: |
+          APP_KEY=""
+          if python3 scripts/resolve_pgyer_appkey.py --type android > /tmp/appkey.txt 2> /tmp/appkey.log; then
+            APP_KEY=$(tr -d '[:space:]' < /tmp/appkey.txt)
+          fi
+          cat /tmp/appkey.log 2>/dev/null || true
+          if [ -n "$APP_KEY" ]; then
+            echo "::notice::已解析安卓 appKey → App 内检测更新走蒲公英 API（含更新说明/大小/直装链接）"
+          else
+            echo "::warning::未解析到安卓 appKey → App 内检测更新退回「公开页解析」（仍能显示版本/大小/更新说明，但下载要跳下载页）"
+          fi
+          echo "PGYER_APP_KEY_RESOLVED=$APP_KEY" >> "$GITHUB_ENV"
+      - name: Build APK (arm64)
+        env:
+          RELEASE_REPO: ${{ vars.RELEASE_REPO }}
+          PGYER_API_KEY: ${{ secrets.PGYER_API_KEY }}
+          AGORA_APP_ID: ${{ secrets.AGORA_APP_ID }}
+          PGYER_SHORTCUT_ANDROID: ${{ secrets.PGYER_SHORTCUT_ANDROID }}
+        run: |
+          # App 内「检测更新」要拉一个【公开可匿名访问】的 version.json。
+          # ⚠️ 本仓库是 private，它自己的 Release 资源匿名访问会 404 → 统一指向公开的发布仓库
+          #    （vars.RELEASE_REPO）；未配置时退化为本仓库，那种情况下 version.json 取不到，
+          #    App 会靠蒲公英那两路（API / 公开页）兜底。
+          PUB="${RELEASE_REPO:-${{ github.repository }}}"
+          UPD="--dart-define=UPDATE_JSON_URL=https://github.com/$PUB/releases/latest/download/version.json"
+          # App 内 iOS 的备用下载入口指向源码仓库 Release 页面（浏览器登录 GitHub 后可下
+          # IPA），把仓库地址交给 App，免得改仓库名还要回来改 Dart。
+          SRC="--dart-define=SOURCE_REPO=${{ github.repository }}"
+          if [ -z "$RELEASE_REPO" ]; then
+            echo "::warning::未配置 vars.RELEASE_REPO：version.json 源指向 private 仓库，App 内只能靠蒲公英兜底"
+          else
+            echo "更新源：https://github.com/$PUB/releases/latest/download/version.json"
+          fi
+          # 蒲公英凭据（两个都有才注入；缺一个就走零凭据的公开页路径）
+          PGY=""
+          if [ -n "$PGYER_API_KEY" ] && [ -n "$PGYER_APP_KEY_RESOLVED" ]; then
+            PGY="--dart-define=PGYER_API_KEY=$PGYER_API_KEY --dart-define=PGYER_APP_KEY=$PGYER_APP_KEY_RESOLVED"
+          else
+            echo "::notice::未注入蒲公英凭据，App 内检测更新使用「公开页解析」（零凭据）"
+          fi
+          # 应用标识 dart-define：真值在 Secrets，源码不落值（lib/config.dart、update_checker.dart）
+          if [ -z "$AGORA_APP_ID" ]; then
+            echo "::error::未配置 Secret AGORA_APP_ID —— 没有它 App 连不上声网，拒绝出废包"
+            exit 1
+          fi
+          if [ -z "$PGYER_SHORTCUT_ANDROID" ]; then
+            echo "::warning::未配置 Secret PGYER_SHORTCUT_ANDROID —— App 内「公开页解析/前往下载页」将停用"
+          fi
+          PRIV="--dart-define=AGORA_APP_ID=$AGORA_APP_ID --dart-define=PGYER_SHORTCUT_ANDROID=$PGYER_SHORTCUT_ANDROID"
+          # --split-debug-info 把 so 里的调试符号拆到本地目录，APK 能再小几 MB
+          # —— 用户是拿流量从蒲公英下载更新的，包体直接等于更新流量
+          flutter build apk --split-per-abi \
+            --split-debug-info=build/symbols/android \
+            --build-name="1.0.${{ github.run_number }}" \
+            --build-number=${{ github.run_number }} \
+            --dart-define=APP_BUILD=${{ github.run_number }} \
+            $UPD $SRC $PGY $PRIV
+      - name: Pick arm64 APK
+        run: |
+          set -e
+          ls -lh build/app/outputs/flutter-apk/
+          mkdir -p build/dist
+          APK=$(ls build/app/outputs/flutter-apk/app-arm64-v8a-release.apk 2>/dev/null \
+                || ls build/app/outputs/flutter-apk/*.apk | head -1)
+          cp "$APK" build/dist/duidui_video.apk
+          ls -lh build/dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: duidui-android-apk
+          path: build/dist/duidui_video.apk
+
+      # 上传到蒲公英分发（配置了 PGYER_API_KEY 才执行；没配则跳过，仅留 Artifacts 下载）
+      # ⚠️ 必须校验响应 JSON：curl 大文件上传中途断连时进程可能不带非零退出，
+      # 不校验就会出现「步骤 success 但蒲公英上还是旧包」的静默假成功（踩过：48MB 传到 36% 断连）。
+      - name: Upload APK to Pgyer
+        env:
+          PGYER_API_KEY: ${{ secrets.PGYER_API_KEY }}
+        run: |
+          if [ -z "$PGYER_API_KEY" ]; then
+            echo "::notice::未配置 PGYER_API_KEY，跳过蒲公英上传（可到仓库 Settings→Secrets 添加）"
+            exit 0
+          fi
+          # 更新说明：取上次 latest 发布以来的提交历史（无 tag 则退化为最新一次提交）
+          PREV=$(git describe --tags --abbrev=0 2>/dev/null) || true
+          RANGE="${PREV:+$PREV..}HEAD"
+          DESC=$(git -c core.pager=cat log "$RANGE" --pretty=format:"- %s" 2>/dev/null | head -30)
+          [ -z "$DESC" ] && DESC=$(git log -1 --pretty=format:"- %s")
+          UPDATE_DESC="Android #${{ github.run_number }}"
+          if [ -n "$DESC" ]; then UPDATE_DESC="$UPDATE_DESC"$'\n'"$DESC"; fi
+          RESP=$(curl -sS --retry 3 --retry-delay 5 --retry-all-errors --connect-timeout 30 \
+               -F "file=@build/dist/duidui_video.apk" \
+               -F "_api_key=$PGYER_API_KEY" \
+               -F "buildUpdateDescription=$UPDATE_DESC" \
+               https://www.pgyer.com/apiv2/app/upload)
+          echo "$RESP"
+          echo "$RESP" | grep -q '"code":0' || { echo "::error::蒲公英上传失败（Android）：$RESP"; exit 1; }
+          echo "::notice::蒲公英上传成功：Android #${{ github.run_number }}"
+          # ⚠️ 上传响应里【没有 appKey 字段】（实测确认），别想从这里拿 appKey。
+          # 这里打印短链名与公开页地址：它决定 resolve_pgyer_appkey.py 从哪个页面取 agKey
+          # （脚本读 Secret PGYER_SHORTCUT_ANDROID 传入），也是 App 端 pgyerPageUrl 的来源
+          # —— 换应用/换短链时更新对应 Secret 即可，不用改代码。
+          SHORT=$(echo "$RESP" | python3 -c "import sys,json;d=json.load(sys.stdin).get('data') or {};print(d.get('buildShortcutUrl') or '')" 2>/dev/null || true)
+          # ⚠️ 用 if 而不是 `[ -n "$SHORT" ] && echo`：后者在变量为空时整行返回 1，
+          #    而这里是本步骤的最后一行 → 步骤直接判失败（run 取最后一条命令的退出码）。
+          if [ -n "$SHORT" ]; then echo "::notice::安卓公开页 https://www.pgyer.com/$SHORT"; fi
+
+  # ============ iOS IPA（需 macos 跑 Xcode） ============
+  # 给 TrollStore 用：development 签名 IPA 即可（TrollStore 会重签）；无证书则产出未签名 IPA。
+  ios:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: '3.24.0'
+      - run: flutter pub get
+      - run: flutter create --project-name duidui_video --platforms=android,ios --android-language kotlin --ios-language swift .
+      - run: cp -r native_patches/android/app/src/main/AndroidManifest.xml android/app/src/main/AndroidManifest.xml
+      - run: mkdir -p android/app/src/main/kotlin/com/example/duidui_video
+      - run: cp native_patches/android/app/src/main/kotlin/com/example/duidui_video/MainActivity.kt android/app/src/main/kotlin/com/example/duidui_video/MainActivity.kt
+      - run: cp native_patches/ios/Runner/Info.plist ios/Runner/Info.plist
+      # AppDelegate 只多挂了一条 duidui/native 通道（goHome：退后台不杀进程，给 PiP 用）。
+      # ⚠️ 它不做 AVCaptureSession swizzle，和之前那个导致未签名包闪退的补丁无关。
+      - run: cp native_patches/ios/Runner/AppDelegate.swift ios/Runner/AppDelegate.swift
+
+      # 悬浮窗(PiP)说明：PiP 由声网 Flutter SDK 内部实现（Dart 侧 createPipController()），
+      # 原生侧只需：① MainActivity 继承 AgoraPIPFlutterActivity ② Info.plist 的 UIBackgroundModes 含 audio（上面已覆盖）。
+      # ⚠️ 不再使用自写 AppDelegate.swift：之前那个文件 swizzle AVCaptureSession 并开
+      # isMultitaskingCameraAccessEnabled，需要 com.apple.developer.avfoundation.multitasking-camera-access
+      # entitlement——未签名 / TrollStore 包没有该 entitlement，会在进房（Agora 创建摄像头会话）时直接闪退。
+      # 该开关对“PiP 里自己画面静止”也治标不治本（声网内部会话拿不到），故整个移除。
+
+      # 无证书构建关键：flutter build ios --no-codesign 只让 Runner 主目标免签名，
+      # 但 CocoaPods 的各 framework 目标仍会要求 Development Team 而失败；
+      # 另外新 Xcode 的脚本沙箱也可能让 Run Script 阶段失败。
+      # 这里给 Podfile 注入 post_install 关闭 pod 目标签名，并关闭脚本沙箱。
+      - name: Patch iOS project — disable codesigning & script sandbox (unsigned IPA)
+        run: python3 scripts/patch_ios_podfile.py
+
+      # 安装证书 + 描述文件（仅在配置了 IOS_CERTIFICATE 时执行）
+      - name: Install signing cert & profile (if configured)
+        env:
+          IOS_CERTIFICATE: ${{ secrets.IOS_CERTIFICATE }}
+          IOS_CERT_PASSWORD: ${{ secrets.IOS_CERT_PASSWORD }}
+          IOS_PROVISIONING_PROFILE: ${{ secrets.IOS_PROVISIONING_PROFILE }}
+        run: |
+          if [ -z "$IOS_CERTIFICATE" ]; then
+            echo "::notice::未配置 iOS 证书，将产出未签名 IPA（供 TrollStore 重签）"
+            exit 0
+          fi
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-sign.keychain-db
+          security create-keychain -p "" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "" "$KEYCHAIN_PATH"
+          echo -n "$IOS_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -P "$IOS_CERT_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          echo -n "$IOS_PROVISIONING_PROFILE" | base64 --decode > ~/Library/MobileDevice/Provisioning\ Profiles/duidui.mobileprovision
+
+      # 同安卓：解析 iOS 应用的蒲公英 appKey，供 App 内「检测更新」调 apiv2/app/check。
+      # iOS 是**另一个独立蒲公英应用**（短链/agKey 都不同于安卓），别和安卓混。
+      # 解析失败不 fail 构建 —— App 会退回「公开页解析」（需注入短链 Secret）。
+      - name: Resolve Pgyer appKey (ios)
+        env:
+          PGYER_API_KEY: ${{ secrets.PGYER_API_KEY }}
+          PGYER_APP_KEY: ${{ vars.PGYER_APP_KEY_IOS }}
+          PGYER_SHORTCUT_IOS: ${{ secrets.PGYER_SHORTCUT_IOS }}
+        run: |
+          APP_KEY=""
+          if python3 scripts/resolve_pgyer_appkey.py --type ios > /tmp/appkey.txt 2> /tmp/appkey.log; then
+            APP_KEY=$(tr -d '[:space:]' < /tmp/appkey.txt)
+          fi
+          cat /tmp/appkey.log 2>/dev/null || true
+          if [ -n "$APP_KEY" ]; then
+            echo "::notice::已解析 iOS appKey → App 内检测更新走蒲公英 API（含更新说明/大小）"
+          else
+            echo "::warning::未解析到 iOS appKey → App 内检测更新退回「公开页解析」"
+          fi
+          echo "PGYER_APP_KEY_RESOLVED=$APP_KEY" >> "$GITHUB_ENV"
+
+      # 有证书 → 开发签名 IPA；没证书 → 构建未签名 Runner.app 再手动打包成 IPA（TrollStore 会自行重签）。
+      # 注意：flutter build ipa 是「归档」流程，必然需要 Development Team，无证书会直接失败；
+      # 故无证书时改用 flutter build ios --no-codesign 产出未签名 .app，再 zip 成 Payload/IPA。
+      - name: Build IPA
+        env:
+          IOS_CERTIFICATE: ${{ secrets.IOS_CERTIFICATE }}
+          RELEASE_REPO: ${{ vars.RELEASE_REPO }}
+          PGYER_API_KEY: ${{ secrets.PGYER_API_KEY }}
+          AGORA_APP_ID: ${{ secrets.AGORA_APP_ID }}
+          PGYER_SHORTCUT_IOS: ${{ secrets.PGYER_SHORTCUT_IOS }}
+        run: |
+          set -o pipefail
+          # 同安卓：注入公开的 version.json 源（private 仓库的 Release 资源匿名 404）
+          PUB="${RELEASE_REPO:-${{ github.repository }}}"
+          UPD="--dart-define=UPDATE_JSON_URL=https://github.com/$PUB/releases/latest/download/version.json"
+          echo "更新源：https://github.com/$PUB/releases/latest/download/version.json"
+          # iOS 的备用下载入口指向源码仓库 Release 页面（浏览器登录 GitHub 后可下 IPA）。
+          # 主入口是蒲公英管理中心（agKey 由下面注入的 PGYER_APP_KEY 决定），同安卓注入仓库地址。
+          SRC="--dart-define=SOURCE_REPO=${{ github.repository }}"
+          # 蒲公英凭据（两个都有才注入）。值会随 -v 打进 /tmp/ios_build.log，
+          # GitHub Actions 会按 secret 名单自动打码成 ***，日志只对仓库可见。
+          PGY=""
+          if [ -n "$PGYER_API_KEY" ] && [ -n "$PGYER_APP_KEY_RESOLVED" ]; then
+            PGY="--dart-define=PGYER_API_KEY=$PGYER_API_KEY --dart-define=PGYER_APP_KEY=$PGYER_APP_KEY_RESOLVED"
+          else
+            echo "::notice::未注入蒲公英凭据，App 内检测更新使用「公开页解析」（零凭据）"
+          fi
+          # 应用标识 dart-define：真值在 Secrets，源码不落值（lib/config.dart、update_checker.dart）。
+          # ⚠️ 值是 Secret，若随 --verbose 进构建日志，GitHub 会自动打码。
+          if [ -z "$AGORA_APP_ID" ]; then
+            echo "::error::未配置 Secret AGORA_APP_ID —— 没有它 App 连不上声网，拒绝出废包"
+            exit 1
+          fi
+          if [ -z "$PGYER_SHORTCUT_IOS" ]; then
+            echo "::warning::未配置 Secret PGYER_SHORTCUT_IOS —— App 内「公开页解析/蒲公英入口」将停用"
+          fi
+          PRIV="--dart-define=AGORA_APP_ID=$AGORA_APP_ID --dart-define=PGYER_SHORTCUT_IOS=$PGYER_SHORTCUT_IOS"
+          if [ -z "$IOS_CERTIFICATE" ]; then
+            echo "::notice::无证书 → 构建未签名 Runner.app 并手动打包成 IPA（TrollStore 可装）"
+            echo "ios-build-step: v4"
+            # 用 --verbose 跑，Flutter 不会给 xcodebuild 加 -quiet，真实报错才会打印出来；
+            # 否则只会看到误导性的 "requires a selected Development Team" 兜底信息。
+            if ! flutter build ios --no-codesign --release --verbose --build-name="1.0.${{ github.run_number }}" --build-number=${{ github.run_number }} --dart-define=APP_BUILD=${{ github.run_number }} $UPD $SRC $PGY $PRIV > /tmp/ios_build.log 2>&1; then
+              echo "=================== iOS 构建失败诊断 ==================="
+              echo "----- 关键错误行（grep）-----"
+              grep -nEi "error:|error \(|code[ _-]?sign|provision|development team|sandbox|deny|fatal|Command PhaseScriptExecution|BUILD FAILED|ld: |clang:|failed" /tmp/ios_build.log | head -200 || true
+              echo "----- 日志尾部 300 行 -----"
+              tail -n 300 /tmp/ios_build.log
+              echo "======================================================"
+              echo "::error::iOS 未签名构建失败，真实原因见上方诊断输出"
+              exit 1
+            fi
+            APP_PATH=$(find build/ios -maxdepth 2 -name "Runner.app" | head -1)
+            if [ -z "$APP_PATH" ]; then echo "::error::未找到 Runner.app，构建可能失败"; exit 1; fi
+            echo "APP_PATH=$APP_PATH"
+            mkdir -p build/ios/Payload
+            rm -rf build/ios/Payload/Runner.app
+            cp -r "$APP_PATH" build/ios/Payload/
+            mkdir -p build/ios/ipa
+            rm -f build/ios/ipa/duidui_video.ipa
+            # 注意：下面 zip 是在 build/ios 目录里执行的，所以输出路径写 ipa/xxx.ipa
+            # （写成 ../ipa/xxx.ipa 会落到 build/ipa，而那个目录不存在 → zip I/O error）
+            (cd build/ios && zip -q -r ipa/duidui_video.ipa Payload)
+            ls -lh build/ios/ipa/
+          else
+            flutter build ipa --export-method development --build-name="1.0.${{ github.run_number }}" --build-number=${{ github.run_number }} --dart-define=APP_BUILD=${{ github.run_number }} $UPD $SRC $PGY $PRIV
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: duidui-ios-ipa
+          path: build/ios/ipa/*.ipa
+
+      # 同安卓：校验蒲公英响应，防「步骤 success 但没传上去」的静默假成功
+      - name: Upload IPA to Pgyer
+        env:
+          PGYER_API_KEY: ${{ secrets.PGYER_API_KEY }}
+        run: |
+          if [ -z "$PGYER_API_KEY" ]; then
+            echo "::notice::未配置 PGYER_API_KEY，跳过蒲公英上传"
+            exit 0
+          fi
+          # 更新说明：取上次 latest 发布以来的提交历史（无 tag 则退化为最新一次提交）
+          PREV=$(git describe --tags --abbrev=0 2>/dev/null) || true
+          RANGE="${PREV:+$PREV..}HEAD"
+          DESC=$(git -c core.pager=cat log "$RANGE" --pretty=format:"- %s" 2>/dev/null | head -30)
+          [ -z "$DESC" ] && DESC=$(git log -1 --pretty=format:"- %s")
+          UPDATE_DESC="iOS #${{ github.run_number }}"
+          if [ -n "$DESC" ]; then UPDATE_DESC="$UPDATE_DESC"$'\n'"$DESC"; fi
+          IPA=$(ls build/ios/ipa/*.ipa | head -1)
+          RESP=$(curl -sS --retry 3 --retry-delay 5 --retry-all-errors --connect-timeout 30 \
+               -F "file=@$IPA" \
+               -F "_api_key=$PGYER_API_KEY" \
+               -F "buildUpdateDescription=$UPDATE_DESC" \
+               https://www.pgyer.com/apiv2/app/upload)
+          echo "$RESP"
+          echo "$RESP" | grep -q '"code":0' || { echo "::error::蒲公英上传失败（iOS）：$RESP"; exit 1; }
+          echo "::notice::蒲公英上传成功：iOS #${{ github.run_number }}"
+          # 同安卓：打印公开页短链（iOS 与安卓是两个独立蒲公英应用、两个 agKey）
+          SHORT=$(echo "$RESP" | python3 -c "import sys,json;d=json.load(sys.stdin).get('data') or {};print(d.get('buildShortcutUrl') or '')" 2>/dev/null || true)
+          if [ -n "$SHORT" ]; then echo "::notice::iOS 公开页 https://www.pgyer.com/$SHORT"; fi
+          # iOS 侧「拿下载地址」的现状（2026-09-17 实测，别再走弯路）：
+          #   · 蒲公英的 IPA 文件存在私有 OSS 上，形如
+          #       http://oss.pgyer.com/<buildFileKey>?auth_key=<每次现签的签名>
+          #     不带 auth_key 访问 = 403；签名由蒲公英「登录态」的下载入口现签。
+          #   · 公开可行路径都不通：/app/plist/<buildKey> 已 404（官方文档里那个地址失效）；
+          #     /manager/version/download/<buildKey> 只返回登录页（未登录 = 210KB 登录页）；
+          #     上传接口返回里也【没有】任何文件直链字段。
+          # 所以这里：① 记下后台下载入口（作者本人已登录蒲公英时可用，走蒲公英速度）；
+          #          ② 试一下未公开的 apiv2/app/download 能否铸出签名直链（失败不影响构建）。
+          BK=$(echo "$RESP" | python3 -c "import sys,json;print(json.load(sys.stdin)['data']['buildKey'])" 2>/dev/null || true)
+          FK=$(echo "$RESP" | python3 -c "import sys,json;print(json.load(sys.stdin)['data']['buildFileKey'])" 2>/dev/null || true)
+          : > pgyer_ios_meta.txt
+          echo "BUILD_KEY=$BK" >> pgyer_ios_meta.txt
+          echo "FILE_KEY=$FK" >> pgyer_ios_meta.txt
+          echo "MANAGER_URL=https://www.pgyer.com/manager/version/download/$BK" >> pgyer_ios_meta.txt
+          IPA_URL=""
+          if [ -n "$BK" ]; then
+            PROBE=$(curl -sS --retry 2 --retry-delay 3 --connect-timeout 20 \
+              "https://www.pgyer.com/apiv2/app/download?_api_key=$PGYER_API_KEY&buildKey=$BK" 2>/dev/null || true)
+            echo "::notice::apiv2/app/download 响应（前 400 字）：$(printf '%s' "$PROBE" | head -c 400)"
+            IPA_URL=$(printf '%s' "$PROBE" | sed 's#\\/#/#g' | grep -oE 'https?://[^"]+\.ipa[^"]*' | head -1 || true)
+          fi
+          echo "IPA_URL=$IPA_URL" >> pgyer_ios_meta.txt
+          if [ -n "$IPA_URL" ]; then
+            echo "::notice::已取得蒲公英签名 IPA 直链（可能有时效）"
+          else
+            echo "::warning::未取得蒲公英 IPA 文件直链（蒲公英未公开该能力）→ iOS 下载走 GitHub Release"
+          fi
+          cat pgyer_ios_meta.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pgyer-ios-meta
+          path: pgyer_ios_meta.txt
+
+  # ============ 发布固定直链（GitHub Release 滚动更新） ============
+  # 目的：iOS 未签名 IPA 无法用蒲公英 itms-services 安装（蒲公英的 IPA 下载还要登录态），
+  # 所以统一发布到 GitHub Release，并保证文件名恒定 → 下载地址**永远不变**：
+  #   iOS : https://github.com/<RELEASE_REPO>/releases/latest/download/duidui_video.ipa
+  #   And : https://github.com/<RELEASE_REPO>/releases/latest/download/duidui_video.apk
+  # ⚠️ <RELEASE_REPO> 必须是【公开】仓库：本仓库是 private，它自己的 Release 资源匿名 404。
+  release:
+    runs-on: ubuntu-latest
+    needs: [android, ios]
+    permissions:
+      contents: write
+    steps:
+      # gh CLI 需要 git 仓库上下文才能推断目标仓库（否则报
+      # "failed to run git: fatal: not a git repository"），故这里也要 checkout。
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: duidui-android-apk
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: duidui-ios-ipa
+          path: dist
+      # 方案2：拿到 iOS 蒲公英直链（可能为空，未配 PGYER_API_KEY 时跳过）
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: pgyer-ios-meta
+          path: meta
+      # 统一改成固定文件名（保证上面的 latest/download 直链恒定）
+      - name: Normalize asset file names
+        run: |
+          set -e
+          ls -lhR dist
+          # 注意：iOS 产物本身就叫 duidui_video.ipa，若源文件与目标同名，mv 会报
+          # "are the same file" 并以非零码退出，故同名时跳过。
+          APK=$(find dist -name '*.apk' | head -1)
+          IPA=$(find dist -name '*.ipa' | head -1)
+          if [ -z "$APK" ]; then echo "::error::dist 下没找到 apk"; exit 1; fi
+          if [ -z "$IPA" ]; then echo "::error::dist 下没找到 ipa"; exit 1; fi
+          if [ "$APK" != "dist/duidui_video.apk" ]; then mv "$APK" dist/duidui_video.apk; fi
+          if [ "$IPA" != "dist/duidui_video.ipa" ]; then mv "$IPA" dist/duidui_video.ipa; fi
+          ls -lh dist
+      # 先生成 version.json（App 内「检测更新」+ 下载入口都读它），必须放在发布步骤【之前】。
+      - name: Generate version.json
+        env:
+          RELEASE_REPO: ${{ vars.RELEASE_REPO }}
+          RUN_NUMBER: ${{ github.run_number }}
+          PGYER_SHORTCUT_ANDROID: ${{ secrets.PGYER_SHORTCUT_ANDROID }}
+        run: |
+          set -e
+          # 未配 vars.RELEASE_REPO 时退化为本仓库自身：仓库公开后其 Release 资源
+          # 匿名可访问，GitHub 直链直接可用（旧假设「本仓库恒为 private」已不成立）。
+          RELEASE_REPO="${RELEASE_REPO:-${{ github.repository }}}"
+          export RELEASE_REPO
+          # 蒲公英下载页兜底入口：从安卓短链 Secret 拼出（源码不落短链）
+          PGYER_PAGE_URL="${PGYER_PAGE_URL:-}"
+          if [ -z "$PGYER_PAGE_URL" ] && [ -n "$PGYER_SHORTCUT_ANDROID" ]; then
+            export PGYER_PAGE_URL="https://www.pgyer.com/$PGYER_SHORTCUT_ANDROID"
+          fi
+          PGYER_IOS_IPA_URL=""
+          if [ -f meta/pgyer_ios_meta.txt ]; then
+            PGYER_IOS_IPA_URL=$(grep -m1 '^IPA_URL=' meta/pgyer_ios_meta.txt | cut -d= -f2- | tr -d '[:space:]' || true)
+          fi
+          export PGYER_IOS_IPA_URL
+          # 生成逻辑全在 scripts/gen_version_json.py 里：
+          #   · ⚠️ GitHub 直链只在配了 vars.RELEASE_REPO（【公开】仓库）时才非空 ——
+          #     本仓库是 private，它的 Release 资源匿名访问一律 404，写进去就是点了报错的死链；
+          #     留空后 App 会改为显示「前往下载页」。
+          #   · 同时写入更新说明（git log）与两个平台的安装包大小，
+          #     这样即使蒲公英那两路都不可用，App 也能展示「更新说明 + 大小」。
+          #   · 用 json.dump 输出：提交标题里可能出现引号/反斜杠，heredoc 拼 JSON 会拼坏。
+          python3 scripts/gen_version_json.py
+          echo "--- version.json ---"; cat dist/version.json
+      - name: Publish rolling release "latest"
+        env:
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          RELEASE_REPO: ${{ vars.RELEASE_REPO }}
+        run: |
+          set -e
+          # 发布目标：vars.RELEASE_REPO（跨仓库，需 PAT）或本仓库自身（GITHUB_TOKEN 即可）。
+          # 本仓库公开后其 Release 资源匿名可访问 —— 不配 vars.RELEASE_REPO 就是完整可用的默认。
+          if [ -n "$RELEASE_REPO" ] && [ "$RELEASE_REPO" != "${{ github.repository }}" ]; then
+            GH_REPO="$RELEASE_REPO"
+            if [ -z "$RELEASE_TOKEN" ]; then
+              echo "::error::配置了 vars.RELEASE_REPO=$RELEASE_REPO，但缺少 secrets.RELEASE_TOKEN。跨仓库发布必须用 PAT（该 PAT 需对目标仓库有 Contents: Read and write）"
+              exit 1
+            fi
+            export GH_TOKEN="$RELEASE_TOKEN"
+          else
+            GH_REPO="${{ github.repository }}"
+            export GH_TOKEN="${{ secrets.GITHUB_TOKEN }}"
+          fi
+          echo "发布目标仓库：$GH_REPO"
+          # 先删掉上一次的滚动发布（含 tag），再重建，保证 latest 永远指向最新构建
+          gh release delete latest --yes --cleanup-tag -R "$GH_REPO" 2>/dev/null || true
+          # 更新说明：取上次 latest 发布以来的提交历史（无 tag 则退化为最新一次提交）
+          PREV=$(git describe --tags --abbrev=0 2>/dev/null) || true
+          RANGE="${PREV:+$PREV..}HEAD"
+          CHANGELOG=$(git -c core.pager=cat log "$RANGE" --pretty=format:"- %s" 2>/dev/null | head -40)
+          [ -z "$CHANGELOG" ] && CHANGELOG=$(git log -1 --pretty=format:"- %s")
+          # 蒲公英后台入口（未配 PGYER_API_KEY 或无该项时为空）——仅作者自用
+          PGYER_MANAGER_URL=""
+          if [ -f meta/pgyer_ios_meta.txt ]; then
+            PGYER_MANAGER_URL=$(grep -m1 '^MANAGER_URL=' meta/pgyer_ios_meta.txt | cut -d= -f2- | tr -d '[:space:]' || true)
+          fi
+          IPA_URL="https://github.com/$GH_REPO/releases/latest/download/duidui_video.ipa"
+          APK_URL="https://github.com/$GH_REPO/releases/latest/download/duidui_video.apk"
+          NOTES="自动构建 #${{ github.run_number }} · commit ${{ github.sha }}｜Android: com.example.duidui_video｜iOS 为未签名 IPA，用 TrollStore 安装（装前请在巨魔设置里 Install ldid）"
+          NOTES="$NOTES"$'\n'"iOS 安装（先装好 TrollStore）："
+          NOTES="$NOTES"$'\n'"  下载 IPA（永久有效）：$IPA_URL"
+          NOTES="$NOTES"$'\n'"  一键安装：apple-magnifier://install?url=$IPA_URL"
+          NOTES="$NOTES"$'\n'"安卓 APK 备用直链（永久有效）：$APK_URL"
+          if [ -n "$PGYER_MANAGER_URL" ]; then
+            NOTES="$NOTES"$'\n'"  蒲公英后台下载入口（需登录蒲公英，仅作者自用）：$PGYER_MANAGER_URL"
+          fi
+          NOTES="$NOTES"$'\n'"本次更新："
+          NOTES="$NOTES"$'\n'"$CHANGELOG"
+          # version.json 已在前面「Generate version.json」步骤生成，此处直接复用。
+          echo "--- version.json ---"; cat dist/version.json
+          gh release create latest -R "$GH_REPO" \
+            --title "对对视频 v1.0.0 (build ${{ github.run_number }})" \
+            --notes "$NOTES" \
+            dist/duidui_video.apk dist/duidui_video.ipa dist/version.json
+          echo "=== 固定下载地址（永久不变，公开可匿名访问）==="
+          echo "iOS : $IPA_URL"
+          echo "And : $APK_URL"

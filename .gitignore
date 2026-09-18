@@ -1,0 +1,38 @@
+# ===== Flutter / Dart 构建产物 =====
+# 本工程只在仓库提交 Dart 源码 + 原生补丁；
+# 原生脚手架（android/、ios/）由 CI 在 GitHub Actions 里 `flutter create` 重建，故忽略
+/android/
+/ios/
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+build/
+
+# ===== 本地临时 / 编辑器 =====
+*.log
+.DS_Store
+.idea/
+.vscode/
+*.iml
+
+# Python 临时产物（本地跑 py_compile / 干跑 CI 脚本时产生，
+# 曾被 `git add -A` 误提交一次，别再让它进来）
+__pycache__/
+*.pyc
+
+# ===== 签名密钥：绝不进仓库（仓库公开后任何人可读）=====
+# keystore 走 GitHub Secrets（ANDROID_KEYSTORE_BASE64 / _PASSWORD，见
+# scripts/patch_android_signing.py 头部说明），本地备份放在仓库目录之外。
+*.keystore
+*.jks
+
+# ===== 保留：源码、原生补丁、工作流、配置 =====
+!native_patches/
+!lib/
+!.github/
+
+# 临时文件（CI 诊断日志/中间产物）
+.tmp_*
+.tmp_agora/
