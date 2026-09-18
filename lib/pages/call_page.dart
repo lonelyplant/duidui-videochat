@@ -106,16 +106,29 @@ class _CallPageState extends State<CallPage> with WidgetsBindingObserver {
       // 停发视频(RemoteMuted)，会把系统暂停的摄像头误判成「对方关了摄像头」。
       if (Platform.isIOS) rtc.sendPeerBackground(true);
     } else if (state == AppLifecycleState.resumed) {
-      // 从桌面/图标重新进 App：若悬浮窗还开着，关掉它、回到正常大屏
+      // 从桌面/图标重新进 App：若系统侧仍在小窗里，关掉它、回到正常大屏
       // （需求：点桌面图标进 App 要自动关闭悬浮窗，展示大屏视频）。
-      if (pip.isActive) {
-        pip.stop();
-        _pipOn = false;
-      }
+      // ⚠️ 必须问原生 isActivated：安卓的 Dart 侧 PiP 状态滞后/不回调
+      //    （见 PipHelper.isActivated 注释），靠 pip.isActive 会误判。
+      _syncPipOnResume();
       // ⚠️ 仅语音档下摄像头必须是关的（applyQuality('audio') 关过它），
       //    不看档位直接恢复会把摄像头误开、开始偷跑视频流量。
       rtc.setCamEnabled(_camOn && _qualityKey != 'audio');
       if (Platform.isIOS) rtc.sendPeerBackground(false);
+    }
+  }
+
+  /// 回前台时同步悬浮窗状态：系统侧仍在小窗 → 关掉回大屏；
+  /// 已不在小窗但 _pipOn 还挂着（小窗已从系统侧退出/从未真正进入）→ 清掉标记，
+  /// 否则主界面会一直停留在「悬浮窗布局」（本地小窗消失、按钮不见）。
+  Future<void> _syncPipOnResume() async {
+    final stillInPip = await pip.isActivated();
+    if (!mounted) return;
+    if (stillInPip) {
+      await pip.stop();
+    }
+    if (mounted && _pipOn && !pip.isActive) {
+      setState(() => _pipOn = false);
     }
   }
 
@@ -253,7 +266,11 @@ class _CallPageState extends State<CallPage> with WidgetsBindingObserver {
     final hideControls = _immersive || _pipOn || pip.isActive || _lifecycleHidden;
     // 悬浮窗期间有对方 → 只显示远端；再放本地小窗看起来就像「悬浮窗里又套了个悬浮窗」。
     // 对方还没进房时保留本地画面，免得小窗一片黑。
-    final inPip = _pipOn || pip.isActive;
+    // ⚠️ 退后台（_lifecycleHidden）也要算「悬浮窗中」：安卓按 Home 自动进小窗时，
+    //    Dart 侧收不到可靠的 PiP 状态回调（activeNotifier 不更新，见 PipHelper），
+    //    只认 _pipOn/pip.isActive 会让小窗里出现「全屏画面 + 本地小窗」好几层画面，
+    //    与手动点「悬浮」按钮（显式置 _pipOn=true）的表现不一致。回前台后自动恢复。
+    final inPip = _pipOn || pip.isActive || _lifecycleHidden;
     // 视频一律用 TextureView（useAndroidSurfaceView: false）：
     // SurfaceView 在安卓悬浮窗（PiP）里会黑屏、且小窗层级会被全屏画面盖住。
     // 安卓返回键/手势不直接退出，先弹挂断确认。

@@ -1,26 +1,22 @@
-// 检测更新：三路取源，合并出「最新版本 + 更新说明 + 包大小 + 下载入口」。
+// 检测更新：两路取源，合并出「最新版本 + 更新说明 + 包大小 + 下载入口」。
 //
 //   ① 蒲公英 API   apiv2/app/check —— 信息最全：版本号、更新说明、包大小、直装链接
 //      需要构建期注入 PGYER_API_KEY + PGYER_APP_KEY（见 .github/workflows/build.yml）。
 //      没有注入时自动跳过 —— 源码仓库里不落任何凭据，本地开发构建也照常能跑。
-//   ② version.json（公开 Release 资源）—— 唯一能提供 iOS 一键装（apple-magnifier://）的源
-//   ③ 蒲公英公开页（零凭据兜底）—— 页面是服务端渲染的，版本/大小/更新说明都能正则取到
+//   ② 蒲公英公开页（零凭据兜底）—— 页面是服务端渲染的，版本/大小/更新说明都能正则取到
 //
-// 三路【并发】发起，因为任一路径单独都拿不全：
-//   · API 有更新说明和大小，但给不了 iOS 一键装 scheme；
-//   · version.json 有 scheme，但你若不建公开仓库它就是 404；
-// 三路【并发】发起，因为任一路径单独都拿不全：
-//   · API 有更新说明和大小，但给不了 iOS 一键装 scheme；
-//   · version.json 有 scheme，但你若不建公开仓库它就是 404；
-//   · 公开页零凭据永远可用，但没有下载直链。
-// 合并规则：取 build 号最大的那条做基准，再用其它源的非空字段补全。
+// 两路【并发】发起：API 有更新说明、大小和直装链接；公开页零凭据永远可用。
+// 合并规则：取 build 号最大的那条做基准，再用另一条的非空字段补全。
+//
+// ⚠️ 曾经的第三路 version.json（GitHub Release 资源）已移除：国内访问 GitHub
+//    时常 502/完全不通，而合并要等最慢的一路，导致每次「检测更新」被它拖到
+//    超时才出结果。随之变化：iOS 一键装（apple-magnifier://）与 GitHub 直链
+//    不再出现，iOS 下载入口 = 「打开蒲公英下载」（管理中心，登录后下载，国内快）。
 //
 // iOS 下载路径的现状：蒲公英的 IPA 存在私有 OSS 上且签名直链要登录态现签，
 // 所以 iOS 的下载按钮 = 打开【蒲公英管理中心里本应用的版本列表页】
 // （见 pgyerDashboardUrl，需登录蒲公英），在那里点下载拿到 IPA，再用 TrollStore
 // 打开安装；另留一个源码仓库 Release 页面作备用入口。
-// 若 version.json 能匿名取到（仓库公开后其 Release 资源即可，或配了 vars.RELEASE_REPO），
-// ios_github_url / ios_trollstore 会自动出现，一键装自动恢复，本文件的兜底逻辑无需改动。
 //
 // ⚠️ 应用标识（声网 App ID / 蒲公英短链 / appKey）不写在源码里：仓库公开后任何人可读，
 // 全部走构建期 --dart-define 注入（真值放 GitHub Secrets），见下方「构建期注入」注释块。
@@ -94,26 +90,13 @@ String get sourceReleasePageUrl => 'https://github.com/$_sourceRepo/releases/lat
 
 /// 兜底用的蒲公英 agKey 已移除：源码不再落任何应用标识。
 /// 「管理中心」直达入口只用构建期注入的 PGYER_APP_KEY（见 pgyerDashboardUrl）；
-/// 未注入时入口隐藏，更新检测退回 version.json / 公开页（若注入了短链）两路。
-
-/// 兜底地址：指向【公开】发布仓库，需与 CI 的 vars.RELEASE_REPO 保持一致。
-/// 该仓库现在还不存在，所以这一路必然 404 —— 保留它是为了「哪天建好了就自动生效」，
-/// 不必再改代码。它出现在失败明细里是预期内的，不是故障。
-const _fallbackUpdateUrl =
-    'https://github.com/lonelyplant/duidui-download/releases/latest/download/version.json';
-
-/// version.json 候选地址，按顺序尝试，第一个返回 200 即采用。
-List<String> updateUrls() {
-  const injected = String.fromEnvironment('UPDATE_JSON_URL');
-  return <String>[
-    if (injected.isNotEmpty) injected,
-    _fallbackUpdateUrl,
-  ];
-}
+/// 未注入时入口隐藏，更新检测退回「蒲公英公开页解析」一路（零凭据可用）。
+/// version.json（GitHub Release 资源）一路已移除：国内访问 GitHub 时常不通，
+/// 曾把每次「检测更新」拖到超时，见文件头部说明。
 
 // ---------------------------------------------------------------- 数据模型
 
-/// 最新版本信息。三路源合并后的结果，各字段都可能为 null。
+/// 最新版本信息。两路源合并后的结果，各字段都可能为 null。
 class AppUpdate {
   final int build; // 用于比较的 build 号（= CI run_number）
   final String version; // 形如 1.0.41
@@ -199,13 +182,12 @@ class AppUpdate {
 /// ⚠️ 这里只记状态码与来源名，绝不记 URL 查询串（可能含 _api_key）。
 final List<String> lastUpdateAttempts = <String>[];
 
-/// 三路并发取源并合并；全都失败返回 null。
+/// 两路并发取源并合并；全都失败返回 null。
 Future<AppUpdate?> fetchLatestUpdate(
     {Duration timeout = const Duration(seconds: 15)}) async {
   lastUpdateAttempts.clear();
   final results = await Future.wait<AppUpdate?>([
     fetchFromPgyerApi(timeout: timeout),
-    fetchFromVersionJson(timeout: timeout),
     fetchFromPgyerPage(timeout: timeout),
   ]);
   AppUpdate? best;
@@ -285,25 +267,7 @@ Future<AppUpdate?> fetchFromPgyerApi(
   }
 }
 
-/// ② version.json：唯一能提供 iOS 一键装 scheme 的一路。
-Future<AppUpdate?> fetchFromVersionJson(
-    {Duration timeout = const Duration(seconds: 15)}) async {
-  for (final url in updateUrls()) {
-    try {
-      final resp = await http.get(Uri.parse(url)).timeout(timeout);
-      // 只记「哪个仓库/文件名」，不把整条 URL 打进可分享的文本里
-      lastUpdateAttempts.add('HTTP ${resp.statusCode} · version.json');
-      if (resp.statusCode != 200) continue;
-      final j = json.decode(utf8.decode(resp.bodyBytes)) as Map<String, dynamic>;
-      return AppUpdate.fromJson(j);
-    } catch (e) {
-      lastUpdateAttempts.add('${e.runtimeType} · version.json');
-    }
-  }
-  return null;
-}
-
-/// ③ 蒲公英公开页（零凭据兜底）：版本、大小、更新说明都能从 SSR 的 HTML 里取到。
+/// ② 蒲公英公开页（零凭据兜底）：版本、大小、更新说明都能从 SSR 的 HTML 里取到。
 Future<AppUpdate?> fetchFromPgyerPage(
     {Duration timeout = const Duration(seconds: 15)}) async {
   // 短链未注入（本地 dev 构建）→ 这一路数据源整个停用
