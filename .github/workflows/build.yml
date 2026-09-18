@@ -100,6 +100,11 @@ jobs:
           if python3 scripts/resolve_pgyer_appkey.py --type android > /tmp/appkey.txt 2> /tmp/appkey.log; then
             APP_KEY=$(tr -d '[:space:]' < /tmp/appkey.txt)
           fi
+          if [ -n "$APP_KEY" ]; then
+            # 运行时打码：appKey 会随 GITHUB_ENV 出现在步骤的 env dump 里，
+            # 公开仓库的日志人人可见，不加这行等于把 agKey 明文公开
+            echo "::add-mask::$APP_KEY"
+          fi
           cat /tmp/appkey.log 2>/dev/null || true
           if [ -n "$APP_KEY" ]; then
             echo "::notice::已解析安卓 appKey → App 内检测更新走蒲公英 API（含更新说明/大小/直装链接）"
@@ -184,8 +189,9 @@ jobs:
           [ -z "$DESC" ] && DESC=$(git log -1 --pretty=format:"- %s")
           UPDATE_DESC="Android #${{ github.run_number }}"
           if [ -n "$DESC" ]; then UPDATE_DESC="$UPDATE_DESC"$'\n'"$DESC"; fi
-          RESP=$(curl -sS --retry 3 --retry-delay 5 --retry-all-errors --connect-timeout 30 \
-               -F "file=@build/dist/duidui_video.apk" \
+      RESP=$(curl -sS --retry 3 --retry-delay 5 --retry-all-errors --connect-timeout 30 \
+           --max-time 1800 --speed-time 60 --speed-limit 1024 \
+           -F "file=@build/dist/duidui_video.apk" \
                -F "_api_key=$PGYER_API_KEY" \
                -F "buildUpdateDescription=$UPDATE_DESC" \
                https://www.pgyer.com/apiv2/app/upload)
@@ -270,6 +276,10 @@ jobs:
           APP_KEY=""
           if python3 scripts/resolve_pgyer_appkey.py --type ios > /tmp/appkey.txt 2> /tmp/appkey.log; then
             APP_KEY=$(tr -d '[:space:]' < /tmp/appkey.txt)
+          fi
+          if [ -n "$APP_KEY" ]; then
+            # 运行时打码：appKey 会随 GITHUB_ENV 出现在步骤的 env dump 里，公开日志可见
+            echo "::add-mask::$APP_KEY"
           fi
           cat /tmp/appkey.log 2>/dev/null || true
           if [ -n "$APP_KEY" ]; then
@@ -370,6 +380,7 @@ jobs:
           if [ -n "$DESC" ]; then UPDATE_DESC="$UPDATE_DESC"$'\n'"$DESC"; fi
           IPA=$(ls build/ios/ipa/*.ipa | head -1)
           RESP=$(curl -sS --retry 3 --retry-delay 5 --retry-all-errors --connect-timeout 30 \
+               --max-time 1800 --speed-time 60 --speed-limit 1024 \
                -F "file=@$IPA" \
                -F "_api_key=$PGYER_API_KEY" \
                -F "buildUpdateDescription=$UPDATE_DESC" \
