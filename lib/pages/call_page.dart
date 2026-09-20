@@ -41,6 +41,16 @@ class _CallPageState extends State<CallPage> with WidgetsBindingObserver {
   // 不再用 Timer.periodic 每秒 setState 整页（整页里有两个 TextureView 平台视图，
   // 低端机上每秒全页重建会掉帧、更耗电）。
   final DateTime _callStart = DateTime.now();
+  // 上一次生命周期状态：iOS 自动进悬浮窗只在 resumed/inactive → inactive 的
+  // 瞬间发起，从后台恢复（paused → inactive）不能重复起小窗。
+  AppLifecycleState _lastLifecycle = AppLifecycleState.resumed;
+
+  /// 「对方画面正在播」＝ 允许自动进悬浮窗的唯一条件。
+  /// 等待对方、对方关摄像头/在后台、纯语音档（无任何视频流）都不进 ——
+  /// 否则按 Home 会弹出黑窗或一窗没用的自己（用户报障）。
+  bool get _peerVideoLive =>
+      rtc.remoteUid != null &&
+      rtc.remoteVideoStateNotifier.value == PeerVideoState.live;
 
   @override
   void initState() {
@@ -49,11 +59,17 @@ class _CallPageState extends State<CallPage> with WidgetsBindingObserver {
     _initQuality();
     // 视频期间保持屏幕常亮（含悬浮窗/后台），挂断时释放
     WakelockPlus.enable().catchError((_) {});
-    // 进通话即“布好”悬浮窗（pipSetup），这样按 Home / 退后台会自动进小窗
+    // 进通话即“布好”悬浮窗（pipSetup），这样按 Home / 退后台会自动进小窗。
+    // ⚠️ 仅当对方画面在播才放开 autoEnter（安卓）——见 _peerVideoLive 注释。
+    pip.autoEnterAllowed = _peerVideoLive;
     pip.prepareAutoEnter(remoteUid: rtc.remoteUid);
+    // 原生总闸同步置位（安卓）：防 iris 层残留上一次通话的 autoEnter 参数。
+    NativeBridge.setAutoPip(_peerVideoLive);
     // 对方进/出房间是在 SDK 回调里发生的，需要监听后手动刷新（否则永远停在「等待对方进入…」）；
     // 同时若此刻正在悬浮窗里，顺带把小窗的画面切一遍（自己 ⇄ 对方）。
     rtc.remoteUidNotifier.addListener(_onRemoteChanged);
+    // 对方画面可用性变化（关/开摄像头、退后台、回前台）也要重算 autoEnter 闸门
+    rtc.remoteVideoStateNotifier.addListener(_onPeerVideoStateChanged);
     // 悬浮窗出现/消失时也要刷新：安卓的悬浮窗镜像整个 Activity 画面，
     // 必须在窗口激活期间把按钮等控件藏掉，小窗里才会只剩视频画面。
     pip.activeNotifier.addListener(_onPipChanged);
@@ -64,13 +80,33 @@ class _CallPageState extends State<CallPage> with WidgetsBindingObserver {
   void _onRemoteChanged() {
     final uid = rtc.remoteUidNotifier.value;
     if (pip.isActive) {
+      // 闸门值也要同步（比如小窗里等到了对方进房，之后回到大屏就允许自动进窗），
+      // 只是正在小窗里时不重设参数（refresh 负责切画面）。
+      pip.autoEnterAllowed = _peerVideoLive;
+      NativeBridge.setAutoPip(_peerVideoLive);
       pip.refresh(remoteUid: uid);
     } else {
-      // 还没进小窗：刷新“待自动进小窗”的布局，确保对方进/出房后，按 Home 进小窗时
-      // 显示的是当前该显示的那一方（有对方显示对方，否则显示自己）。
-      pip.prepareAutoEnter(remoteUid: uid);
+      _updatePipGate();
     }
     if (mounted) setState(() {});
+  }
+
+  void _onPeerVideoStateChanged() {
+    // 统一走 _updatePipGate：闸门三层开关要随时对齐（正在小窗里时
+    // prepareAutoEnter 内部会自行跳过，flags 照常更新）。
+    _updatePipGate();
+    if (mounted) setState(() {});
+  }
+
+  /// 重算「允许自动进悬浮窗」并把三层开关对齐：
+  /// ① pip.autoEnterAllowed（决定下次 pipSetup 的 autoEnterEnabled 参数）
+  /// ② 重新 pipSetup 让参数立即生效（对方进/出、画面停/播时各一次，内部去重）
+  /// ③ 安卓原生总闸（防 iris 层残留旧参数，见 NativeBridge.setAutoPip）
+  void _updatePipGate() {
+    final live = _peerVideoLive;
+    pip.autoEnterAllowed = live;
+    if (!pip.isActive) pip.prepareAutoEnter(remoteUid: rtc.remoteUidNotifier.value);
+    NativeBridge.setAutoPip(live);
   }
 
   void _onPipChanged() {
@@ -98,6 +134,19 @@ class _CallPageState extends State<CallPage> with WidgetsBindingObserver {
     // 按 Home 自动进悬浮窗走的是「先退后台、后出小窗」：必须在退后台那一刻就藏控件，
     // 否则悬浮窗首帧还带着按钮。回到前台（含退出悬浮窗还原回来）再恢复。
     if (mounted) setState(() => _lifecycleHidden = state != AppLifecycleState.resumed);
+    // iOS：autoEnterEnabled 只对安卓生效（SDK 文档标注 Android only）。iOS 要在退后台
+    // 那一瞬（inactive）显式 pipStart()，小窗才会带着画面起播 —— 不调的话系统照样可能
+    // 弹出小窗，但 SDK 图层从未 start、里面没有任何渲染内容，就是用户报的
+    // 「视频界面按 Home，悬浮窗是黑的」（声网官方示例正是这个做法）。
+    // 只在「用户主动离开」（resumed/inactive → inactive）时发起；从后台恢复途中
+    // （paused/hidden → inactive，如看清息屏通知）不重复起窗。对方没在出图就不进。
+    if (Platform.isIOS &&
+        state == AppLifecycleState.inactive &&
+        _lastLifecycle != AppLifecycleState.paused &&
+        _lastLifecycle != AppLifecycleState.hidden &&
+        _peerVideoLive) {
+      pip.start(remoteUid: rtc.remoteUid);
+    }
     // 省电：彻底退后台（息屏/切走、且不在悬浮窗里）时暂停摄像头采集，回前台恢复。
     // 悬浮窗期间（inactive，活动仍可见）不停——悬浮窗可能显示自己，对端也要看到我们。
     if (state == AppLifecycleState.hidden || state == AppLifecycleState.paused) {
@@ -116,17 +165,20 @@ class _CallPageState extends State<CallPage> with WidgetsBindingObserver {
       rtc.setCamEnabled(_camOn && _qualityKey != 'audio');
       if (Platform.isIOS) rtc.sendPeerBackground(false);
     }
+    _lastLifecycle = state;
   }
 
   /// 回前台时同步悬浮窗状态：系统侧仍在小窗 → 关掉回大屏；
   /// 已不在小窗但 _pipOn 还挂着（小窗已从系统侧退出/从未真正进入）→ 清掉标记，
   /// 否则主界面会一直停留在「悬浮窗布局」（本地小窗消失、按钮不见）。
+  /// 顺带把安卓原生总闸恢复成当前闸门值（_togglePip 里为手动进窗临时放过行）。
   Future<void> _syncPipOnResume() async {
     final stillInPip = await pip.isActivated();
     if (!mounted) return;
     if (stillInPip) {
       await pip.stop();
     }
+    NativeBridge.setAutoPip(_peerVideoLive);
     if (mounted && _pipOn && !pip.isActive) {
       setState(() => _pipOn = false);
     }
@@ -137,8 +189,12 @@ class _CallPageState extends State<CallPage> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     WakelockPlus.disable().catchError((_) {});
     rtc.remoteUidNotifier.removeListener(_onRemoteChanged);
+    rtc.remoteVideoStateNotifier.removeListener(_onPeerVideoStateChanged);
     pip.activeNotifier.removeListener(_onPipChanged);
     rtc.connectionStateNotifier.removeListener(_onConnStateChanged);
+    // 离开通话页（挂断）后无论安卓还是 iOS 都不允许再自动弹小窗：
+    // 否则在首页/桌面按 Home 会弹出残留的小窗（用户报障场景）。
+    NativeBridge.setAutoPip(false);
     super.dispose();
   }
 
@@ -192,7 +248,13 @@ class _CallPageState extends State<CallPage> with WidgetsBindingObserver {
           //      而且只有真正退到后台，PiP 才会走系统托管的渲染路径（前台启动容易黑屏）。
           if (Platform.isAndroid) {
             await Future.delayed(const Duration(milliseconds: 400));
-            if (!await pip.isActivated()) await NativeBridge.goHome();
+            if (!await pip.isActivated()) {
+              // 手动进窗不受自动闸门限制（比如对方没进房时用户就想悬浮自己）：
+              // moveTaskToBack 会触发 iris 的 onUserLeaveHint 路径，先临时放开总闸，
+              // 回前台时 _syncPipOnResume 会把它恢复成闸门当前值。
+              await NativeBridge.setAutoPip(true);
+              await NativeBridge.goHome();
+            }
           } else if (Platform.isIOS) {
             await Future.delayed(const Duration(milliseconds: 250));
             // ⚠️ 时序保险：iOS 退后台走的是私有 suspend（**把进程冻住**），而「我在后台」

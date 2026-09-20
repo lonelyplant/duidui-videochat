@@ -33,4 +33,19 @@ class NativeBridge {
       return false;
     }
   }
+
+  /// 安卓专用：允许/禁止系统「按 Home 自动进悬浮窗」。
+  ///
+  /// 为什么 Dart 侧要下发这个开关（安卓-only，iOS 调用无效果）：
+  /// 声网 iris 层一旦在通话中 pipSetup 过（autoEnterEnabled=true），这组
+  /// PictureInPictureParams 就留在 Activity 上，挂断后未必清掉 —— 表现是
+  /// 在首页/桌面按 Home 也会弹出悬浮小窗（用户报障）。Dart 侧重新 pipSetup
+  /// 关掉参数有时够用，但 iris 在 onUserLeaveHint 里的进窗路径不完全受参数
+  /// 控制，所以在 MainActivity 里加一道总闸最可靠。
+  static Future<void> setAutoPip(bool allowed) async {
+    if (!Platform.isAndroid) return;
+    try {
+      await _channel.invokeMethod<bool>('setAutoPip', allowed);
+    } catch (_) {}
+  }
 }

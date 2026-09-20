@@ -56,6 +56,17 @@ class PipHelper {
   /// 最近一次 pipSetup 布局对应的 uid（prepareAutoEnter 去重用）。
   int? _preparedUid;
 
+  /// 最近一次 pipSetup 用的 autoEnter 取值（与 _preparedUid 一起做去重）。
+  bool? _preparedAutoEnter;
+
+  /// 是否允许「退后台自动进悬浮窗」（安卓）。
+  ///
+  /// ⚠️ 只在「对方画面正在播」时置 true（call_page 维护）：等待对方/纯语音/
+  /// 挂断后都不允许 —— 否则在首页按 Home 也会弹出小窗，甚至是一窗黑屏
+  /// （用户报障：「没有进行视频的情况下，返回桌面还是会出现悬浮窗」）。
+  /// 注意 autoEnterEnabled 本身只对安卓生效（SDK 文档标注 Android only）。
+  bool autoEnterAllowed = false;
+
   /// 小窗当前显示的是远端 uid（null 表示显示的是自己）。
   int? get shownUid => _shownUid;
 
@@ -147,17 +158,23 @@ class PipHelper {
   /// [remoteUid] 为当前该显示的方（null = 自己）；对方进/出房时由 call_page 重新调用刷新布局。
   Future<void> prepareAutoEnter({int? remoteUid}) async {
     if (isActive) return; // 已经在小窗里了，交给 refresh/stop 处理
-    // 同一个 uid 已经布过局就别反复 pipSetup：每次 setup 都是两次平台通道往返，
-    // 重复 setup 还可能让小窗闪一下（与 refresh 的去重同理）。
+    // 同一个 uid + 同一个 autoEnter 取值已经布过局就别反复 pipSetup：每次 setup
+    // 都是两次平台通道往返，重复 setup 还可能让小窗闪一下（与 refresh 的去重同理）。
     // 控制器被 dispose 重建后 _preparedUid 已清空，不会误跳过。
-    if (_controller != null && _preparedUid == remoteUid) return;
+    if (_controller != null &&
+        _preparedUid == remoteUid &&
+        _preparedAutoEnter == autoEnterAllowed) {
+      return;
+    }
     final controller = _ensureController();
     if (controller == null) return;
     try {
       final autoEnter = await controller.pipIsAutoEnterSupported();
-      await controller.pipSetup(_buildOptions(remoteUid, autoEnterEnabled: autoEnter));
+      await controller.pipSetup(_buildOptions(remoteUid,
+          autoEnterEnabled: autoEnterAllowed && autoEnter));
       _preparedUid = remoteUid;
-      debugPrint('[duidui] pip prepared (autoEnter=$autoEnter) for remoteUid=${remoteUid ?? '-'}');
+      _preparedAutoEnter = autoEnterAllowed;
+      debugPrint('[duidui] pip prepared (autoEnter=${autoEnterAllowed && autoEnter}) for remoteUid=${remoteUid ?? '-'}');
     } catch (e) {
       debugPrint('[duidui] pip prepareAutoEnter failed: $e');
     }
@@ -204,10 +221,12 @@ class PipHelper {
     if (_shownUid == remoteUid) return;
     try {
       final autoEnter = await controller.pipIsAutoEnterSupported();
-      await controller.pipSetup(_buildOptions(remoteUid, autoEnterEnabled: autoEnter));
+      await controller.pipSetup(_buildOptions(remoteUid,
+          autoEnterEnabled: autoEnterAllowed && autoEnter));
       await controller.pipStart();
       _shownUid = remoteUid;
       _preparedUid = remoteUid;
+      _preparedAutoEnter = autoEnterAllowed;
       debugPrint('[duidui] pip refreshed with remoteUid=${remoteUid ?? '-'}');
     } catch (e) {
       debugPrint('[duidui] pip refresh failed: $e');
@@ -276,6 +295,7 @@ class PipHelper {
     _setActive(false);
     _shownUid = null;
     _preparedUid = null;
+    _preparedAutoEnter = null;
     if (controller == null) return;
     try {
       await controller.pipDispose();
