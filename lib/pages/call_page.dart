@@ -93,7 +93,7 @@ class _CallPageState extends State<CallPage> with WidgetsBindingObserver {
 
   void _onPeerVideoStateChanged() {
     // 统一走 _updatePipGate：闸门三层开关要随时对齐（正在小窗里时
-    // prepareAutoEnter 内部会自行跳过，flags 照常更新）。
+    // prepareAutoEnter 内部会自行跳过，flags 同照常更新）。
     _updatePipGate();
     if (mounted) setState(() {});
   }
@@ -172,14 +172,22 @@ class _CallPageState extends State<CallPage> with WidgetsBindingObserver {
   /// 已不在小窗但 _pipOn 还挂着（小窗已从系统侧退出/从未真正进入）→ 清掉标记，
   /// 否则主界面会一直停留在「悬浮窗布局」（本地小窗消失、按钮不见）。
   /// 顺带把安卓原生总闸恢复成当前闸门值（_togglePip 里为手动进窗临时放过行）。
+  ///
+  /// ⚠️ 必须用系统侧真相（isActivated）来判定、并强制清掉 Dart 侧的 PiP 标记：
+  /// 安卓上 activeNotifier 不回调、会卡在 true（见 PipHelper 注释），原来
+  /// `if (_pipOn && !pip.isActive)` 的判定因此永远不成立，_pipOn 永远清不掉，
+  /// 回大屏后 hideControls 恒为真、按钮/统计/右上角本窗全消失，点画面也救不回来。
   Future<void> _syncPipOnResume() async {
     final stillInPip = await pip.isActivated();
     if (!mounted) return;
     if (stillInPip) {
-      await pip.stop();
+      await pip.stop(); // 系统侧仍在小窗 → 关掉回大屏（点桌面图标进 App 的需求）
     }
+    // 安卓 Dart 侧 PiP 状态不可靠：全屏即不在小窗，强制把 activeNotifier 校正回 false，
+    // 否则它会卡在 true 导致 hideControls 一直为真（同上）。
+    pip.forceInactive();
     NativeBridge.setAutoPip(_peerVideoLive);
-    if (mounted && _pipOn && !pip.isActive) {
+    if (mounted && _pipOn) {
       setState(() => _pipOn = false);
     }
   }
@@ -343,7 +351,12 @@ class _CallPageState extends State<CallPage> with WidgetsBindingObserver {
       },
       child: Scaffold(
       backgroundColor: Colors.black,
-      body: Stack(
+      // 桌面宽屏窗口：通话画面按手机竖屏比例（小米14 ≈ 9:19.5）限宽居中显示，
+      // 与手机端观感一致；两侧留黑边。窄窗口（手机）下 AspectRatio 自动占满，无影响。
+      body: Center(
+        child: AspectRatio(
+          aspectRatio: 9 / 19.5,
+          child: Stack(
         children: [
           // 断网/重连横幅（置于画面之上、控制区之下）
           Positioned(
@@ -528,44 +541,48 @@ class _CallPageState extends State<CallPage> with WidgetsBindingObserver {
             ),
 
           // 顶部中央：对方昵称/头像（通过数据流互传，收到后显示）
-          Positioned(
-            top: MediaQuery.of(context).padding.top + 54,
-            left: 0,
-            right: 0,
-            child: IgnorePointer(
-              child: Center(
-                child: ValueListenableBuilder<PeerProfile?>(
-                  valueListenable: rtc.peerProfileNotifier,
-                  builder: (context, p, _) {
-                    if (p == null || (p.name.isEmpty && p.emoji.isEmpty)) {
-                      return const SizedBox.shrink();
-                    }
-                    return Container(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 12, vertical: 6),
-                      decoration: BoxDecoration(
-                        color: Colors.black54,
-                        borderRadius: BorderRadius.circular(20),
-                      ),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Text(p.emoji.isEmpty
-                              ? ProfileStore.defaultEmoji
-                              : p.emoji,
-                              style: const TextStyle(fontSize: 14)),
-                          const SizedBox(width: 6),
-                          Text(p.name.isEmpty ? '对方' : p.name,
-                              style: const TextStyle(
-                                  color: Colors.white, fontSize: 13)),
-                        ],
-                      ),
-                    );
-                  },
+          // ⚠️ 必须与控件同隐藏条件：安卓悬浮窗镜像整个 Activity，不藏这个昵称条就会
+          // 盖在小窗视频上挡住画面（用户报障：打开悬浮窗后小窗里出现对方头像和姓名）。
+          // 沉浸模式同理隐藏。
+          if (!hideControls)
+            Positioned(
+              top: MediaQuery.of(context).padding.top + 54,
+              left: 0,
+              right: 0,
+              child: IgnorePointer(
+                child: Center(
+                  child: ValueListenableBuilder<PeerProfile?>(
+                    valueListenable: rtc.peerProfileNotifier,
+                    builder: (context, p, _) {
+                      if (p == null || (p.name.isEmpty && p.emoji.isEmpty)) {
+                        return const SizedBox.shrink();
+                      }
+                      return Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 12, vertical: 6),
+                        decoration: BoxDecoration(
+                          color: Colors.black54,
+                          borderRadius: BorderRadius.circular(20),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text(p.emoji.isEmpty
+                                ? ProfileStore.defaultEmoji
+                                : p.emoji,
+                                style: const TextStyle(fontSize: 14)),
+                            const SizedBox(width: 6),
+                            Text(p.name.isEmpty ? '对方' : p.name,
+                                style: const TextStyle(
+                                    color: Colors.white, fontSize: 13)),
+                          ],
+                        ),
+                      );
+                    },
+                  ),
                 ),
               ),
             ),
-          ),
 
           // 左上角：画质选择 + 流量统计
           if (!hideControls)
@@ -687,13 +704,17 @@ class _CallPageState extends State<CallPage> with WidgetsBindingObserver {
                       _toggleScreenShare,
                       color: _screenSharing ? Colors.blue : null,
                     ),
-                  _roundBtn(_pipOn ? Icons.picture_in_picture_alt : Icons.picture_in_picture, '悬浮窗', _togglePip),
+                  // 悬浮窗（PiP）仅安卓/iOS 支持，桌面端不显示该按钮
+                  if (Platform.isAndroid || Platform.isIOS)
+                    _roundBtn(_pipOn ? Icons.picture_in_picture_alt : Icons.picture_in_picture, '悬浮窗', _togglePip),
                   _roundBtn(Icons.call_end, '挂断', _hangUp, color: Colors.red),
                 ],
               ),
             ),
         ],
       ),
+      ),
+        ),
       ),
     );
   }

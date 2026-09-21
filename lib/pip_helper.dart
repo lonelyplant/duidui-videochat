@@ -33,10 +33,16 @@
 //   必须在原生侧设置，声网 Flutter SDK 目前没有暴露（官方 issue #2429 标注 coming soon）。
 //   → 这是系统/SDK 限制，Dart 侧无法绕过；远端画面不受影响，照常动态。
 //   → 实际影响很小：只要对方在场，小窗显示的就是对方，画面正常。
+import 'dart:io';
+
 import 'package:agora_rtc_engine/agora_rtc_engine.dart';
 import 'package:flutter/foundation.dart';
 
 import 'rtc_manager.dart';
+
+/// 桌面端没有画中画能力（AgoraPiPController 仅安卓/iOS 实现），
+/// 直接返回 false，避免 createPipController 在 Windows 上抛平台异常。
+bool get _pipPlatformSupported => Platform.isAndroid || Platform.isIOS;
 
 class PipHelper {
   AgoraPipController? _controller;
@@ -74,6 +80,7 @@ class PipHelper {
   String? get lastError => _lastError;
 
   AgoraPipController? _ensureController() {
+    if (!_pipPlatformSupported) return null;
     final engine = rtc.engine;
     if (engine == null) return null;
     if (_controller != null) return _controller;
@@ -103,6 +110,12 @@ class PipHelper {
       return false;
     }
   }
+
+  /// 安卓上 Dart 侧 PiP 状态常滞后/不回调（见 [isActivated] 注释），[activeNotifier]
+  /// 会卡在 true。回前台（全屏）时强制把它校正回 false：全屏与 PiP 互斥，前台不可能
+  /// 还在小窗里，所以直接置 false 不会误伤；否则 hideControls 一直为真、按钮/统计/
+  /// 右上角本窗全消失（用户报障：从悬浮窗返回大屏后界面再也点不出来）。
+  void forceInactive() => _setActive(false);
 
   /// 当前设备是否支持悬浮窗（iOS 需 15+；安卓需 8+ 且系统允许）。
   Future<bool> isSupported() async {
