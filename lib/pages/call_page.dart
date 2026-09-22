@@ -370,9 +370,11 @@ class _CallPageState extends State<CallPage> with WidgetsBindingObserver {
                 if (st == ConnectionStateType.connectionStateReconnecting) {
                   msg = '网络不稳定，重连中…';
                 } else if (st == ConnectionStateType.connectionStateFailed) {
-                  msg = '连接已断开，请检查网络';
+                  // 失败横幅显示「真实原因」（含 Agora 错误码），不再一律说“网络有问题”
+                  msg = rtc.connectionErrorNotifier.value ?? '连接已断开，请检查网络';
                 }
                 if (msg == null) return const SizedBox.shrink();
+                final failed = st == ConnectionStateType.connectionStateFailed;
                 return Container(
                   margin: const EdgeInsets.symmetric(horizontal: 40),
                   padding:
@@ -382,10 +384,27 @@ class _CallPageState extends State<CallPage> with WidgetsBindingObserver {
                     borderRadius: BorderRadius.circular(8),
                     border: Border.all(color: Colors.orangeAccent, width: 1),
                   ),
-                  child: Text(msg,
-                      textAlign: TextAlign.center,
-                      style: const TextStyle(
-                          color: Colors.orangeAccent, fontSize: 13)),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(msg,
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(
+                              color: Colors.orangeAccent, fontSize: 13)),
+                      if (failed)
+                        TextButton(
+                          onPressed: () => rtc.rejoin(),
+                          style: TextButton.styleFrom(
+                            minimumSize: Size.zero,
+                            padding: const EdgeInsets.only(top: 4),
+                            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                          ),
+                          child: const Text('重试',
+                              style: TextStyle(
+                                  color: Colors.orangeAccent, fontSize: 13)),
+                        ),
+                    ],
+                  ),
                 );
               },
             ),

@@ -1,11 +1,13 @@
 // 声网通话核心封装：初始化、加入房间、本地/远端视图、画质切换、离开
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:agora_rtc_engine/agora_rtc_engine.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'config.dart';
+import 'main.dart';
 import 'profile.dart';
 
 /// 远端画面当前的可用性。通话页据此决定显示视频还是显示占位提示。
@@ -57,6 +59,12 @@ class RtcManager {
   final ValueNotifier<PeerVideoState> remoteVideoStateNotifier =
       ValueNotifier<PeerVideoState>(PeerVideoState.live);
 
+  /// 连接失败的「真实原因」：Agora 错误码 + 可读文案。横幅据此区分
+  /// 「网络问题」与「鉴权 / App ID 问题」，避免误导用户去查网络
+  /// （错误码对排错至关重要，真机抓不到日志也能直接从横幅看到）。
+  final ValueNotifier<String?> connectionErrorNotifier =
+      ValueNotifier<String?>(null);
+
   /// 对方是否处于「后台 / 悬浮窗」状态：由对端通过数据流显式告知（见 onStreamMessage）。
   ///
   /// ⚠️ 为什么需要它：iOS 进 PiP 时系统会暂停本机摄像头采集，声网给对端报的是
@@ -69,6 +77,12 @@ class RtcManager {
   int _statsTick = 0;
   int _savedDur = 0;
   int _savedBytes = 0;
+
+  // 连接诊断：最近一次 Agora 错误码 + 文案，以及 join 用的参数（供「重试」重连）。
+  ErrorCodeType? _lastErrorCode;
+  String _lastErrorMessage = '';
+  String _lastToken = '';
+  String _lastQualityKey = defaultQualityKey;
 
   void _resetStatsBookkeeping() {
     _statsTick = 0;
@@ -124,7 +138,11 @@ class RtcManager {
   Future<void> init({required String token, String qualityKey = defaultQualityKey}) async {
     // 运行时权限必须显式申请：iOS 首次访问会自动弹窗，Android 6+ 不会——
     // 不申请的话安卓摄像头/麦克风根本打不开（本地预览黑屏、对端也看不到/听不到我们）。
-    await [Permission.camera, Permission.microphone].request();
+    // 桌面端（Windows/macOS）没有运行时权限模型（permission_handler 不支持），
+    // 摄像头/麦克风随系统隐私设置，直接跳过申请，否则抛 MissingPluginException。
+    if (Platform.isAndroid || Platform.isIOS) {
+      await [Permission.camera, Permission.microphone].request();
+    }
     _resetStatsBookkeeping();
     // 连接状态/对方画面状态同样跨通话残留：上一通若以 Failed 结束，
     // 下一通进房瞬间会闪一下「连接已断开」横幅，这里一并归零。
@@ -132,7 +150,9 @@ class RtcManager {
     remoteVideoStateNotifier.value = PeerVideoState.live;
     peerBackgroundNotifier.value = false;
     _engine = createAgoraRtcEngine();
-    await _engine!.initialize(RtcEngineContext(appId: agoraAppId));
+    // App ID：构建期注入优先；桌面版未注入时用设置页里用户配置的
+    await _engine!
+        .initialize(RtcEngineContext(appId: await Settings.resolveAppId()));
     // 音频只传人声：speech_standard（32 kHz 单声道，约 24 kbps），与 Web 版已验证的
     // 省流档一致。通话用不到 48 kHz 音乐档；显式设置不依赖 SDK 各版本的默认值。
     // ⚠️ 必须在 joinChannel 之前调用。
@@ -162,6 +182,14 @@ class RtcManager {
       },
       onConnectionStateChanged: (RtcConnection conn, ConnectionStateType state,
           ConnectionChangedReasonType reason) {
+        // 先写「真实失败原因」再置状态：状态变更会触发横幅重建，
+        // 重建时才能读到最新文案（否则会闪一下旧文案）。
+        if (state == ConnectionStateType.connectionStateFailed) {
+          connectionErrorNotifier.value =
+              _describeConnFailure(reason, _lastErrorCode);
+        } else if (state == ConnectionStateType.connectionStateConnected) {
+          connectionErrorNotifier.value = null;
+        }
         connectionStateNotifier.value = state;
       },
       onRemoteVideoStateChanged: (RtcConnection conn, int remoteUid,
@@ -220,6 +248,8 @@ class RtcManager {
       },
       onError: (ErrorCodeType err, String msg) {
         debugPrint('[duidui] agora error: $err $msg');
+        _lastErrorCode = err;
+        _lastErrorMessage = msg;
       },
     ));
   }
@@ -276,7 +306,8 @@ class RtcManager {
       dimensions: VideoDimensions(width: q.w, height: q.h),
       frameRate: q.fps,
       bitrate: q.bitrate,
-      // 关键：原生端固定竖屏，声网会把横屏传感器帧旋转成像素级竖屏，不会像 Web 那样中心裁切放大
+      // 关键：原生端固定竖屏方向，声网会把传感器帧旋转成像素级竖屏，不会像 Web 那样中心裁切放大。
+      // 桌面端与手机保持一致：竖屏编码（桌面摄像头横置时 SDK 自动旋转，UI 上窗口也按竖屏显示）。
       orientationMode: OrientationMode.orientationModeFixedPortrait,
       // ⚠️ 出流【不】镜像：若这里开镜像，发出去的画面是左右颠倒的，对端看到的就是反的
       // （之前“对方画面左右颠倒”的根因——两端都把自己镜像发出，彼此收到都反了）。
@@ -301,6 +332,8 @@ class RtcManager {
   /// 加入频道（房间名即为频道名）。房间名仅允许 ASCII，非 ASCII 会被清洗。
   Future<void> join({required String room, required String token, required String qualityKey}) async {
     _channel = _sanitizeRoom(room);
+    _lastToken = token;
+    _lastQualityKey = qualityKey;
     peerProfileNotifier.value = null; // 新的一通，清掉上一位的资料
     await applyQuality(qualityKey);
     await _engine?.joinChannel(
@@ -407,6 +440,32 @@ class RtcManager {
     } catch (e) {
       debugPrint('[duidui] stopScreenShare failed: $e');
     }
+  }
+
+  /// 把 Agora 的「连接失败」翻译成人话：到底是鉴权 / App ID 问题（与网络无关），
+  /// 还是真连不上。用枚举的 toString() 做关键字匹配，避免写死枚举名导致编译失败。
+  String _describeConnFailure(ConnectionChangedReasonType reason, ErrorCodeType? err) {
+    final r = reason.toString();
+    final e = err?.toString() ?? '';
+    final isAuth = r.contains('Token') ||
+        r.contains('InvalidAppId') ||
+        r.contains('Rejected') ||
+        e.contains('InvalidToken') ||
+        e.contains('InvalidAppId') ||
+        e.contains('JoinChannelRejected');
+    if (isAuth) {
+      return '声网鉴权失败（$r / $e）：多为 App ID 与声网项目不匹配，'
+          '或项目开启了 Token 鉴权（本 App 走「仅 App ID」模式，Token 留空）。'
+          '请到声网控制台关闭 Token 鉴权，或在「设置 → 高级」填入临时 Token。';
+    }
+    return '连接已断开，请检查网络（$r / $e）';
+  }
+
+  /// 连接失败后手动「重试」：用上次 join 的参数重连一次。
+  Future<void> rejoin() async {
+    if (_channel.isEmpty) return;
+    connectionErrorNotifier.value = null;
+    await join(room: _channel, token: _lastToken, qualityKey: _lastQualityKey);
   }
 
   /// 离开频道。悬浮窗（PiP）由 PipHelper 单独管理，这里不动。
