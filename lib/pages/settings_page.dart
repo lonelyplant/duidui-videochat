@@ -5,6 +5,7 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 
+import '../android_updater.dart';
 import '../config.dart';
 import '../main.dart';
 import '../profile.dart';
@@ -24,6 +25,7 @@ class SettingsPage extends StatefulWidget {
 class _SettingsPageState extends State<SettingsPage> {
   final _nameCtl = TextEditingController();
   final _tokenCtl = TextEditingController();
+  final _appIdCtl = TextEditingController();
   String _emoji = ProfileStore.defaultEmoji;
   String _qualityKey = defaultQualityKey;
   Map<String, num> _stats = {'calls': 0, 'seconds': 0, 'mb': 0.0};
@@ -43,6 +45,7 @@ class _SettingsPageState extends State<SettingsPage> {
     _nameCtl.text = await ProfileStore.getName();
     _emoji = await ProfileStore.getEmoji();
     _tokenCtl.text = await Settings.getToken();
+    _appIdCtl.text = await Settings.getAppId();
     _qualityKey = await Settings.getQuality();
     _stats = await CallStats.load();
     if (mounted) setState(() {});
@@ -52,8 +55,13 @@ class _SettingsPageState extends State<SettingsPage> {
   void dispose() {
     _nameCtl.dispose();
     _tokenCtl.dispose();
+    _appIdCtl.dispose();
     super.dispose();
   }
+
+  /// 桌面版专属：构建期没有注入 App ID 时，允许用户在设置里配置。
+  /// 手机端始终由 CI 注入，不显示该项。
+  bool get _showAppIdField => Platform.isWindows && agoraAppId.isEmpty;
 
   Widget _group(String title, List<Widget> children) {
     return Container(
@@ -206,6 +214,25 @@ class _SettingsPageState extends State<SettingsPage> {
             _hint('收发合计，按次累计（<3 秒的通话不计）。'),
           ]),
 
+          // ---------- 声网 App ID（仅桌面版显示） ----------
+          if (_showAppIdField) ...[
+            _group('声网 App ID', [
+              TextField(
+                controller: _appIdCtl,
+                style: const TextStyle(color: Colors.white, fontSize: 14),
+                decoration: const InputDecoration(
+                  labelText: 'App ID（与手机端同一个声网项目）',
+                  labelStyle: TextStyle(color: Colors.white54),
+                  border: OutlineInputBorder(),
+                ),
+                onChanged: (v) => Settings.setAppId(v),
+              ),
+              _hint('电脑版安装包不内置 App ID，填入后即可通话，改动即时保存，'
+                  '下次进入房间生效。在声网控制台「项目详情」里可查到，'
+                  '需与手机端使用同一个项目，双方才能互相看见。'),
+            ]),
+          ],
+
           // ---------- 高级 ----------
           _group('高级', [
             TextField(
@@ -250,7 +277,7 @@ class _SettingsPageState extends State<SettingsPage> {
                 const SizedBox(height: 3),
                 Text(
                   '当前版本 ${currentBuild == 0 ? 'dev' : 'v1.0.$currentBuild'}'
-                  '${Platform.isAndroid ? ' · 安卓' : ' · iOS'}',
+                  '${Platform.isAndroid ? ' · 安卓' : Platform.isIOS ? ' · iOS' : ' · 电脑版'}',
                   style: const TextStyle(color: Colors.white38, fontSize: 12),
                 ),
               ],
@@ -480,7 +507,8 @@ class _SettingsPageState extends State<SettingsPage> {
   String _fallbackUrl() =>
       Platform.isAndroid ? pgyerPageUrl : pgyerDashboardUrl;
 
-  /// 按平台给出下载按钮。此处只是拼按钮，**不触发下载**。
+  /// 按平台给出下载按钮。安卓的「下载安装包」按钮会**直接触发应用内下载**
+  /// （进度画在按钮里、下完自动调起安装，见 android_updater.dart）；其余按钮仅打开链接。
   List<Widget> _downloadActions(AppUpdate latest) {
     final list = <Widget>[];
     if (Platform.isAndroid) {
@@ -488,18 +516,9 @@ class _SettingsPageState extends State<SettingsPage> {
       final apk = latest.androidApkUrl;
       final page = latest.androidUrl ?? pgyerPageUrl;
       if (apk != null && apk.isNotEmpty) {
-        list.add(FilledButton.icon(
-          onPressed: () => openLink(apk),
-          icon: const Icon(Icons.download, size: 16),
-          label: const Text('下载安装包', style: TextStyle(fontSize: 13)),
-          style: FilledButton.styleFrom(
-            backgroundColor: _green,
-            foregroundColor: Colors.white,
-            visualDensity: VisualDensity.compact,
-          ),
-        ));
-        // 留个后路：万一直装链接在某个浏览器里被拦（或蒲公英当天额度用尽），
-        // 用户还能走下载页手动点。
+        // 应用内下载：进度直接画在按钮里，下完自动调起安装（见 android_updater.dart）
+        list.add(ApkDownloadButton(url: apk, fallbackPageUrl: page));
+        // 留个后路：万一直装链接被拦（或蒲公英当天额度用尽），还能走下载页手动点。
         if (page.isNotEmpty) {
           list.add(TextButton(
             onPressed: () => openLink(page),

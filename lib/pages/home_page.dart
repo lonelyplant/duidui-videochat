@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import '../config.dart';
 import '../main.dart';
@@ -34,11 +36,14 @@ class _HomePageState extends State<HomePage> {
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('请输入房间名')));
       return;
     }
-    // App ID 是构建期注入的：没注入（本地直接 flutter run）时进不了声网，提前拦下并说明
-    if (agoraAppId.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text('未配置声网 App ID：构建时需要 --dart-define=AGORA_APP_ID 注入'
-              '（真值放 GitHub Secrets，不进源码）')));
+    // App ID：构建期注入或设置页配置均可；两者都没有进不了声网，提前拦下并说明
+    final appId = await Settings.resolveAppId();
+    if (appId.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(Platform.isWindows
+              ? '未配置声网 App ID：请到「设置 → 声网 App ID」填写'
+              : '未配置声网 App ID：构建时需要 --dart-define=AGORA_APP_ID 注入'
+                  '（真值放 GitHub Secrets，不进源码）')));
       return;
     }
     setState(() => _initing = true);
@@ -74,7 +79,11 @@ class _HomePageState extends State<HomePage> {
   Widget build(BuildContext context) {
     return Scaffold(
       body: SafeArea(
-        child: Padding(
+        // 桌面窗口很宽：内容限宽居中，避免输入框/按钮被拉满整窗
+        child: Center(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 520),
+            child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -149,11 +158,15 @@ class _HomePageState extends State<HomePage> {
               ),
               const SizedBox(height: 4),
               Text(
-                '提示：iOS 用 TrollStore 安装 IPA，安卓直接装 APK，均无需上架应用商店。',
+                Platform.isWindows
+                    ? '提示：电脑版从设置页「检测更新」或 Release 页面下载 exe 安装包。'
+                    : '提示：iOS 用 TrollStore 安装 IPA，安卓直接装 APK，均无需上架应用商店。',
                 style: TextStyle(color: Colors.white.withOpacity(.4), fontSize: 12),
               ),
             ],
           ),
+        ),
+      ),
         ),
       ),
     );

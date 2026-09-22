@@ -26,6 +26,12 @@ dependencies:
   # 检测更新：拉取 version.json + 打开下载页 / TrollStore scheme
   http: ^1.2.0
   url_launcher: ^6.3.0
+  # 安卓应用内下载 APK + 自动调起安装：进度画在按钮里
+  # （dio 纯 Dart 无原生；path_provider / open_filex 为成熟插件，Android 构建风险低）
+  dio: ^5.4.0
+  path_provider: ^2.1.5
+  open_filex: ^4.7.0
+  window_manager: 0.4.0
 
 dev_dependencies:
   flutter_test:
