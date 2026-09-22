@@ -7,7 +7,6 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'config.dart';
-import 'main.dart';
 import 'profile.dart';
 
 /// 远端画面当前的可用性。通话页据此决定显示视频还是显示占位提示。
@@ -150,9 +149,8 @@ class RtcManager {
     remoteVideoStateNotifier.value = PeerVideoState.live;
     peerBackgroundNotifier.value = false;
     _engine = createAgoraRtcEngine();
-    // App ID：构建期注入优先；桌面版未注入时用设置页里用户配置的
-    await _engine!
-        .initialize(RtcEngineContext(appId: await Settings.resolveAppId()));
+    // App ID：构建期通过 --dart-define=AGORA_APP_ID 注入（见 config.dart 的 agoraAppId）。
+    await _engine!.initialize(RtcEngineContext(appId: agoraAppId));
     // 音频只传人声：speech_standard（32 kHz 单声道，约 24 kbps），与 Web 版已验证的
     // 省流档一致。通话用不到 48 kHz 音乐档；显式设置不依赖 SDK 各版本的默认值。
     // ⚠️ 必须在 joinChannel 之前调用。
